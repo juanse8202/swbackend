@@ -15,10 +15,30 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import include, path
+
+from .authentication import (
+    EmailOrUsernameTokenObtainPairView,
+)
+
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('api/diagramas/', include('diagramas.urls')),
-    path('api/proyectos/', include('proyectos.urls')),
+    path("admin/", admin.site.urls),
+
+    # Login JWT con nombre de usuario o correo.
+    path(
+        "api/login/",
+        EmailOrUsernameTokenObtainPairView.as_view(),
+        name="token_obtain_pair",
+    ),
+
+    path(
+        "api/proyectos/",
+        include("proyectos.urls"),
+    ),
+
+    path(
+        "api/diagramas/",
+        include("diagramas.urls"),
+    ),
 ]
