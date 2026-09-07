@@ -8,15 +8,21 @@ https://docs.djangoproject.com/en/6.1/howto/deployment/asgi/
 """
 
 import os
-from django.core.asgi import get_asgi_application
-from channels.routing import ProtocolTypeRouter, URLRouter
-from channels.auth import AuthMiddlewareStack
-import diagramas.routing
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
+from django.core.asgi import get_asgi_application
+
+# Inicializa el registro de aplicaciones antes de importar consumidores/modelos.
+django_asgi_application = get_asgi_application()
+
+from channels.auth import AuthMiddlewareStack
+from channels.routing import ProtocolTypeRouter, URLRouter
+
+import diagramas.routing
+
 application = ProtocolTypeRouter({
-    "http": get_asgi_application(),
+    "http": django_asgi_application,
     "websocket": AuthMiddlewareStack(
         URLRouter(
             diagramas.routing.websocket_urlpatterns
