@@ -20,6 +20,7 @@ class VersionDiagramaSerializer(serializers.ModelSerializer):
     class Meta:
         model = VersionDiagrama
         fields = '__all__'
+        read_only_fields = ['usuario']
 
 class DiagramaSerializer(serializers.ModelSerializer):
     class Meta:

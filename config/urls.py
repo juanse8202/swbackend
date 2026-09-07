@@ -18,19 +18,26 @@ from django.contrib import admin
 from django.urls import include, path
 
 from .authentication import (
-    EmailOrUsernameTokenObtainPairView,
+    CsrfTokenView,
+    CurrentUserView,
+    LoginView,
+    LogoutView,
+    RegistroView,
 )
+from diagramas.views import MiLienzoView
 
 
 urlpatterns = [
     path("admin/", admin.site.urls),
 
-    # Login JWT con nombre de usuario o correo.
-    path(
-        "api/login/",
-        EmailOrUsernameTokenObtainPairView.as_view(),
-        name="token_obtain_pair",
-    ),
+    # Sesion Django con nombre de usuario o correo.
+    path("api/csrf/", CsrfTokenView.as_view(), name="csrf"),
+    path("api/me/", CurrentUserView.as_view(), name="current-user"),
+    path("api/mi-lienzo/", MiLienzoView.as_view(), name="mi-lienzo"),
+    path("api/login/", LoginView.as_view(), name="login"),
+    path("api/registro/", RegistroView.as_view(), name="registro"),
+    path("api/logout/", LogoutView.as_view(), name="logout"),
+    path("accounts/", include("allauth.urls")),
 
     path(
         "api/proyectos/",

@@ -6,11 +6,11 @@ from .views import (
 )
 
 router = DefaultRouter()
-router.register(r'diagramas', DiagramaViewSet)
-router.register(r'clases', ClaseUMLViewSet)
-router.register(r'atributos', AtributoUMLViewSet)
-router.register(r'relaciones', RelacionUMLViewSet)
-router.register(r'versiones', VersionDiagramaViewSet)
+router.register(r'diagramas', DiagramaViewSet, basename='diagrama')
+router.register(r'clases', ClaseUMLViewSet, basename='clase-uml')
+router.register(r'atributos', AtributoUMLViewSet, basename='atributo-uml')
+router.register(r'relaciones', RelacionUMLViewSet, basename='relacion-uml')
+router.register(r'versiones', VersionDiagramaViewSet, basename='version-diagrama')
 
 urlpatterns = [
     path('', include(router.urls)),
