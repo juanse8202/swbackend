@@ -9,7 +9,15 @@ class UserSerializer(serializers.ModelSerializer):
         fields = ['id', 'username', 'email']
 
 class ProyectoSerializer(serializers.ModelSerializer):
+    creador_detalle = UserSerializer(source='creador', read_only=True)
+    colaboradores_detalle = UserSerializer(source='colaboradores', many=True, read_only=True)
+
     class Meta:
         model = Proyecto
-        fields = '__all__'
-        read_only_fields = ['creador']
+        fields = [
+            'id', 'nombre', 'creador', 'colaboradores', 'fecha_creacion',
+            'creador_detalle', 'colaboradores_detalle',
+        ]
+        # La membresía se administra exclusivamente mediante las acciones de
+        # invitación y eliminación; no desde un PATCH genérico.
+        read_only_fields = ['creador', 'colaboradores', 'fecha_creacion']

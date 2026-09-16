@@ -2,10 +2,11 @@ from django.test import TestCase
 
 from django.contrib.auth import get_user_model
 
-from .services import get_default_diagram
+from diagramas.models import Diagrama
+from .models import Proyecto
 
 
-class PrivateWorkspaceTests(TestCase):
+class CollaborativeProjectTests(TestCase):
     def setUp(self):
         User = get_user_model()
         self.first_user = User.objects.create_user(
@@ -14,15 +15,24 @@ class PrivateWorkspaceTests(TestCase):
         self.second_user = User.objects.create_user(
             username='beto', email='beto@example.com', password='clave-segura'
         )
-        self.second_diagram = get_default_diagram(self.second_user)
+        self.project = Proyecto.objects.create(nombre='Arquitectura', creador=self.second_user)
+        self.second_diagram = Diagrama.objects.create(proyecto=self.project, nombre='Principal')
 
-    def test_each_user_gets_a_private_default_diagram(self):
+    def test_registration_creates_a_private_personal_workspace(self):
         self.client.force_login(self.first_user)
-
-        response = self.client.get('/api/mi-lienzo/')
-
+        response = self.client.get('/api/proyectos/proyectos/')
         self.assertEqual(response.status_code, 200)
-        self.assertNotEqual(response.json()['id'], self.second_diagram.id)
+        personal_projects = Proyecto.objects.filter(
+            creador=self.first_user, nombre='Mi lienzo personal'
+        )
+        self.assertEqual(personal_projects.count(), 1)
+        self.assertTrue(Diagrama.objects.filter(
+            proyecto=personal_projects.get(), nombre='Diagrama principal'
+        ).exists())
+        personal_diagram = Diagrama.objects.get(proyecto=personal_projects.get())
+        self.assertEqual(personal_diagram.clases.count(), 2)
+        self.assertEqual(personal_diagram.relaciones.count(), 1)
+        self.assertNotIn(self.second_diagram.id, [item['id'] for item in response.json()])
 
     def test_user_cannot_access_another_users_diagram(self):
         self.client.force_login(self.first_user)
@@ -32,5 +42,39 @@ class PrivateWorkspaceTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 404)
+
+    def test_creator_can_create_project_and_invite_collaborator(self):
+        self.client.force_login(self.first_user)
+        create_response = self.client.post(
+            '/api/proyectos/proyectos/', {'nombre': 'Sistema de ventas'}, content_type='application/json'
+        )
+        self.assertEqual(create_response.status_code, 201)
+        project_id = create_response.json()['id']
+        self.assertTrue(Diagrama.objects.filter(proyecto_id=project_id, nombre='Diagrama principal').exists())
+
+        invite_response = self.client.post(
+            f'/api/proyectos/proyectos/{project_id}/invitar/',
+            {'email': self.second_user.email}, content_type='application/json'
+        )
+        self.assertEqual(invite_response.status_code, 200)
+        self.assertIn(self.second_user.id, invite_response.json()['colaboradores'])
+
+        self.client.force_login(self.second_user)
+        diagrams_response = self.client.get('/api/diagramas/diagramas/')
+        self.assertEqual(diagrams_response.status_code, 200)
+        self.assertTrue(any(item['proyecto'] == project_id for item in diagrams_response.json()))
+
+    def test_collaborator_cannot_invite_another_user(self):
+        third_user = get_user_model().objects.create_user(
+            username='carla', email='carla@example.com', password='clave-segura'
+        )
+        self.project.colaboradores.add(self.first_user)
+        self.client.force_login(self.first_user)
+
+        response = self.client.post(
+            f'/api/proyectos/proyectos/{self.project.id}/invitar/',
+            {'email': third_user.email}, content_type='application/json'
+        )
+        self.assertEqual(response.status_code, 403)
 
 # Create your tests here.

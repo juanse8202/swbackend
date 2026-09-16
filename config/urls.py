@@ -24,7 +24,6 @@ from .authentication import (
     LogoutView,
     RegistroView,
 )
-from diagramas.views import MiLienzoView
 
 
 urlpatterns = [
@@ -33,7 +32,6 @@ urlpatterns = [
     # Sesion Django con nombre de usuario o correo.
     path("api/csrf/", CsrfTokenView.as_view(), name="csrf"),
     path("api/me/", CurrentUserView.as_view(), name="current-user"),
-    path("api/mi-lienzo/", MiLienzoView.as_view(), name="mi-lienzo"),
     path("api/login/", LoginView.as_view(), name="login"),
     path("api/registro/", RegistroView.as_view(), name="registro"),
     path("api/logout/", LogoutView.as_view(), name="logout"),
