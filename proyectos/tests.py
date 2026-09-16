@@ -77,4 +77,21 @@ class CollaborativeProjectTests(TestCase):
         )
         self.assertEqual(response.status_code, 403)
 
+    def test_diagram_nodes_and_edges_are_persisted_after_patch(self):
+        self.project.colaboradores.add(self.first_user)
+        self.client.force_login(self.first_user)
+        nodes = [{'id': 'usuario', 'type': 'uml', 'position': {'x': 120, 'y': 80}, 'data': {'nombre': 'Usuario'}}]
+        edges = [{'id': 'usuario-proyecto', 'source': 'usuario', 'target': 'proyecto'}]
+
+        update_response = self.client.patch(
+            f'/api/diagramas/diagramas/{self.second_diagram.id}/',
+            {'nodes': nodes, 'edges': edges}, content_type='application/json'
+        )
+        self.assertEqual(update_response.status_code, 200)
+
+        retrieve_response = self.client.get(f'/api/diagramas/diagramas/{self.second_diagram.id}/')
+        self.assertEqual(retrieve_response.status_code, 200)
+        self.assertEqual(retrieve_response.json()['nodes'], nodes)
+        self.assertEqual(retrieve_response.json()['edges'], edges)
+
 # Create your tests here.

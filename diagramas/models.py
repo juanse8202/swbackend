@@ -4,6 +4,10 @@ from django.contrib.auth.models import User
 class Diagrama(models.Model):
     proyecto = models.ForeignKey('proyectos.Proyecto', on_delete=models.CASCADE, related_name='diagramas')
     nombre = models.CharField(max_length=200)
+    # Estado completo que entrega React Flow. Mantenerlo como JSON conserva IDs,
+    # estilos, posiciones y datos propios de los nodos sin perderlos al recargar.
+    nodes = models.JSONField(default=list, blank=True)
+    edges = models.JSONField(default=list, blank=True)
     fecha_creacion = models.DateTimeField(auto_now_add=True)
     fecha_modificacion = models.DateTimeField(auto_now=True)
 
