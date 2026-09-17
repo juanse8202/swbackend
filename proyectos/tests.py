@@ -3,7 +3,7 @@ from django.test import TestCase
 from django.contrib.auth import get_user_model
 
 from diagramas.models import Diagrama
-from .models import Proyecto
+from .models import Proyecto, ProyectoMiembro
 
 
 class CollaborativeProjectTests(TestCase):
@@ -44,7 +44,9 @@ class CollaborativeProjectTests(TestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_diagrams_can_be_filtered_by_project(self):
-        self.project.colaboradores.add(self.first_user)
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
         own_project = Proyecto.objects.create(
             nombre='Proyecto propio', creador=self.first_user
         )
@@ -74,21 +76,56 @@ class CollaborativeProjectTests(TestCase):
 
         invite_response = self.client.post(
             f'/api/proyectos/proyectos/{project_id}/invitar/',
-            {'email': self.second_user.email}, content_type='application/json'
+            {'email': self.second_user.email, 'rol': 'arquitecto'}, content_type='application/json'
         )
         self.assertEqual(invite_response.status_code, 200)
         self.assertIn(self.second_user.id, invite_response.json()['colaboradores'])
+        invited_member = next(
+            member for member in invite_response.json()['miembros']
+            if member['usuario']['id'] == self.second_user.id
+        )
+        self.assertEqual(invited_member['rol'], 'arquitecto')
 
         self.client.force_login(self.second_user)
         diagrams_response = self.client.get('/api/diagramas/diagramas/')
         self.assertEqual(diagrams_response.status_code, 200)
         self.assertTrue(any(item['proyecto'] == project_id for item in diagrams_response.json()))
 
+    def test_reader_cannot_edit_diagram(self):
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.LECTOR
+        )
+        self.client.force_login(self.first_user)
+
+        response = self.client.patch(
+            f'/api/diagramas/diagramas/{self.second_diagram.id}/',
+            {'nodes': []}, content_type='application/json'
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_owner_can_change_member_role(self):
+        miembro = ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
+        self.client.force_login(self.second_user)
+
+        response = self.client.patch(
+            f'/api/proyectos/proyectos/{self.project.id}/miembros/{self.first_user.id}/',
+            {'rol': 'lector'}, content_type='application/json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        miembro.refresh_from_db()
+        self.assertEqual(miembro.rol, ProyectoMiembro.Rol.LECTOR)
+
     def test_collaborator_cannot_invite_another_user(self):
         third_user = get_user_model().objects.create_user(
             username='carla', email='carla@example.com', password='clave-segura'
         )
-        self.project.colaboradores.add(self.first_user)
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
         self.client.force_login(self.first_user)
 
         response = self.client.post(
@@ -98,7 +135,9 @@ class CollaborativeProjectTests(TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_diagram_nodes_and_edges_are_persisted_after_patch(self):
-        self.project.colaboradores.add(self.first_user)
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.ARQUITECTO
+        )
         self.client.force_login(self.first_user)
         nodes = [{'id': 'usuario', 'type': 'uml', 'position': {'x': 120, 'y': 80}, 'data': {'nombre': 'Usuario'}}]
         edges = [{'id': 'usuario-proyecto', 'source': 'usuario', 'target': 'proyecto'}]

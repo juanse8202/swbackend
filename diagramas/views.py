@@ -1,22 +1,22 @@
-from django.db.models import Q
 from rest_framework import viewsets
-from rest_framework.exceptions import PermissionDenied
-from .models import Diagrama, ClaseUML, AtributoUML, RelacionUML, VersionDiagrama
+
+from proyectos.models import ProyectoMiembro
+from proyectos.permissions import EDIT_ROLES, require_role, role_for
+from .models import AtributoUML, ClaseUML, Diagrama, RelacionUML, VersionDiagrama
 from .serializers import (
-    DiagramaSerializer, ClaseUMLSerializer, AtributoUMLSerializer,
-    RelacionUMLSerializer, VersionDiagramaSerializer
+    AtributoUMLSerializer, ClaseUMLSerializer, DiagramaSerializer,
+    RelacionUMLSerializer, VersionDiagramaSerializer,
 )
+
 
 class DiagramAccessMixin:
     def allowed_diagrams(self):
-        user = self.request.user
         return Diagrama.objects.filter(
-            Q(proyecto__creador=user) | Q(proyecto__colaboradores=user)
+            proyecto__miembros__usuario=self.request.user
         ).distinct()
 
-    def ensure_allowed_diagram(self, diagrama):
-        if not self.allowed_diagrams().filter(pk=diagrama.pk).exists():
-            raise PermissionDenied("No tienes permiso para acceder a este lienzo.")
+    def require_diagram_role(self, diagrama, roles, message='No tienes permiso para editar este lienzo.'):
+        require_role(self.request.user, diagrama.proyecto, roles, message)
 
 
 class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
@@ -25,26 +25,53 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = self.allowed_diagrams()
         proyecto_id = self.request.query_params.get('proyecto')
-
-        # El editor carga un proyecto a la vez. Aplicar el filtro en el
-        # servidor evita que diagramas de otros proyectos accesibles se
-        # mezclen al reabrir uno existente.
         if proyecto_id:
             queryset = queryset.filter(proyecto_id=proyecto_id)
-
-        return queryset
+        return queryset.order_by('fecha_creacion', 'id')
 
     def perform_create(self, serializer):
-        project = serializer.validated_data['proyecto']
-        if not (project.creador == self.request.user or project.colaboradores.filter(pk=self.request.user.pk).exists()):
-            raise PermissionDenied("No tienes permiso para usar este proyecto.")
+        require_role(
+            self.request.user, serializer.validated_data['proyecto'],
+            {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+        )
         serializer.save()
 
     def perform_update(self, serializer):
-        project = serializer.validated_data.get('proyecto', serializer.instance.proyecto)
-        if not (project.creador == self.request.user or project.colaboradores.filter(pk=self.request.user.pk).exists()):
-            raise PermissionDenied("No tienes permiso para usar este proyecto.")
+        self.require_diagram_role(serializer.instance, EDIT_ROLES)
+        if (
+            role_for(self.request.user, serializer.instance.proyecto)
+            == ProyectoMiembro.Rol.EDITOR
+            and 'edges' in serializer.validated_data
+            and serializer.validated_data['edges'] != serializer.instance.edges
+        ):
+            require_role(
+                self.request.user,
+                serializer.instance.proyecto,
+                {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+                'Solo un arquitecto puede modificar relaciones.',
+            )
+        if (
+            serializer.instance.proyecto_id != serializer.validated_data.get(
+                'proyecto', serializer.instance.proyecto
+            ).id
+        ):
+            self.require_diagram_role(
+                serializer.instance,
+                {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+            )
+            require_role(
+                self.request.user, serializer.validated_data['proyecto'],
+                {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+            )
         serializer.save()
+
+    def perform_destroy(self, instance):
+        self.require_diagram_role(
+            instance,
+            {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+        )
+        instance.delete()
+
 
 class ClaseUMLViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
     serializer_class = ClaseUMLSerializer
@@ -53,12 +80,17 @@ class ClaseUMLViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         return ClaseUML.objects.filter(diagrama__in=self.allowed_diagrams())
 
     def perform_create(self, serializer):
-        self.ensure_allowed_diagram(serializer.validated_data['diagrama'])
+        self.require_diagram_role(serializer.validated_data['diagrama'], EDIT_ROLES)
         serializer.save()
 
     def perform_update(self, serializer):
-        self.ensure_allowed_diagram(serializer.validated_data.get('diagrama', serializer.instance.diagrama))
+        self.require_diagram_role(serializer.instance.diagrama, EDIT_ROLES)
         serializer.save()
+
+    def perform_destroy(self, instance):
+        self.require_diagram_role(instance.diagrama, EDIT_ROLES)
+        instance.delete()
+
 
 class AtributoUMLViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
     serializer_class = AtributoUMLSerializer
@@ -67,13 +99,17 @@ class AtributoUMLViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         return AtributoUML.objects.filter(clase__diagrama__in=self.allowed_diagrams())
 
     def perform_create(self, serializer):
-        self.ensure_allowed_diagram(serializer.validated_data['clase'].diagrama)
+        self.require_diagram_role(serializer.validated_data['clase'].diagrama, EDIT_ROLES)
         serializer.save()
 
     def perform_update(self, serializer):
-        clase = serializer.validated_data.get('clase', serializer.instance.clase)
-        self.ensure_allowed_diagram(clase.diagrama)
+        self.require_diagram_role(serializer.instance.clase.diagrama, EDIT_ROLES)
         serializer.save()
+
+    def perform_destroy(self, instance):
+        self.require_diagram_role(instance.clase.diagrama, EDIT_ROLES)
+        instance.delete()
+
 
 class RelacionUMLViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
     serializer_class = RelacionUMLSerializer
@@ -82,12 +118,26 @@ class RelacionUMLViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         return RelacionUML.objects.filter(diagrama__in=self.allowed_diagrams())
 
     def perform_create(self, serializer):
-        self.ensure_allowed_diagram(serializer.validated_data['diagrama'])
+        self.require_diagram_role(
+            serializer.validated_data['diagrama'],
+            {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+        )
         serializer.save()
 
     def perform_update(self, serializer):
-        self.ensure_allowed_diagram(serializer.validated_data.get('diagrama', serializer.instance.diagrama))
+        self.require_diagram_role(
+            serializer.instance.diagrama,
+            {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+        )
         serializer.save()
+
+    def perform_destroy(self, instance):
+        self.require_diagram_role(
+            instance.diagrama,
+            {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+        )
+        instance.delete()
+
 
 class VersionDiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
     serializer_class = VersionDiagramaSerializer
@@ -96,5 +146,19 @@ class VersionDiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         return VersionDiagrama.objects.filter(diagrama__in=self.allowed_diagrams())
 
     def perform_create(self, serializer):
-        self.ensure_allowed_diagram(serializer.validated_data['diagrama'])
+        self.require_diagram_role(serializer.validated_data['diagrama'], EDIT_ROLES)
         serializer.save(usuario=self.request.user)
+
+    def perform_update(self, serializer):
+        self.require_diagram_role(
+            serializer.instance.diagrama,
+            {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+        )
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self.require_diagram_role(
+            instance.diagrama,
+            {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+        )
+        instance.delete()

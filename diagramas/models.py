@@ -54,3 +54,16 @@ class VersionDiagrama(models.Model):
     usuario = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
     datos_snapshot = models.JSONField()
     fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+
+class PresenciaDiagrama(models.Model):
+    """Conexion WebSocket activa de un usuario dentro de un diagrama."""
+    diagrama = models.ForeignKey(
+        Diagrama, on_delete=models.CASCADE, related_name='presencias'
+    )
+    usuario = models.ForeignKey(User, on_delete=models.CASCADE)
+    channel_name = models.CharField(max_length=255, unique=True)
+    fecha_conexion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['diagrama', 'usuario'])]

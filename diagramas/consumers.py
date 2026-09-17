@@ -1,15 +1,15 @@
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
-from django.db.models import Q
 from django.utils import timezone
 
-from .models import Diagrama
+from .models import Diagrama, PresenciaDiagrama
+from proyectos.models import ProyectoMiembro
 
 
 @database_sync_to_async
 def user_can_access_diagram(user_id, diagram_id):
     return Diagrama.objects.filter(
-        Q(proyecto__creador_id=user_id) | Q(proyecto__colaboradores__id=user_id),
+        proyecto__miembros__usuario_id=user_id,
         pk=diagram_id,
     ).exists()
 
@@ -17,14 +17,61 @@ def user_can_access_diagram(user_id, diagram_id):
 @database_sync_to_async
 def save_diagram_if_user_can_access(user_id, diagram_id, nodes, edges):
     """Guarda el lienzo solo si el usuario sigue perteneciendo al proyecto."""
-    return Diagrama.objects.filter(
-        Q(proyecto__creador_id=user_id) | Q(proyecto__colaboradores__id=user_id),
-        pk=diagram_id,
-    ).update(
+    diagram = Diagrama.objects.filter(pk=diagram_id).first()
+    if diagram is None:
+        return False
+    try:
+        membership = diagram.proyecto.miembros.get(usuario_id=user_id)
+    except ProyectoMiembro.DoesNotExist:
+        return False
+    if membership.rol not in {
+        ProyectoMiembro.Rol.PROPIETARIO,
+        ProyectoMiembro.Rol.ARQUITECTO,
+        ProyectoMiembro.Rol.EDITOR,
+    }:
+        return False
+    if membership.rol == ProyectoMiembro.Rol.EDITOR and diagram.edges != edges:
+        return False
+
+    return Diagrama.objects.filter(pk=diagram_id).update(
         nodes=nodes,
         edges=edges,
         fecha_modificacion=timezone.now(),
     ) > 0
+
+
+@database_sync_to_async
+def register_presence(diagram_id, user_id, channel_name):
+    PresenciaDiagrama.objects.update_or_create(
+        channel_name=channel_name,
+        defaults={'diagrama_id': diagram_id, 'usuario_id': user_id},
+    )
+
+
+@database_sync_to_async
+def remove_presence(channel_name):
+    PresenciaDiagrama.objects.filter(channel_name=channel_name).delete()
+
+
+@database_sync_to_async
+def active_members(diagram_id):
+    """Devuelve usuarios unicos, incluso si uno abrio varias pestañas."""
+    members = []
+    seen_user_ids = set()
+    presences = PresenciaDiagrama.objects.filter(
+        diagrama_id=diagram_id
+    ).select_related('usuario').order_by('fecha_conexion')
+    for presence in presences:
+        if presence.usuario_id not in seen_user_ids:
+            seen_user_ids.add(presence.usuario_id)
+            members.append({
+                'usuario': {
+                    'id': presence.usuario_id,
+                    'username': presence.usuario.username,
+                    'email': presence.usuario.email,
+                }
+            })
+    return members
 
 
 class DiagramaConsumer(AsyncJsonWebsocketConsumer):
@@ -44,12 +91,25 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
         self.room_group_name = f'diagram_{self.diagrama_id}'
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
+        await register_presence(self.diagrama_id, user.id, self.channel_name)
+        await self.broadcast_presence()
 
     async def disconnect(self, close_code):
         if hasattr(self, 'room_group_name'):
+            await remove_presence(self.channel_name)
             await self.channel_layer.group_discard(
                 self.room_group_name, self.channel_name
             )
+            await self.broadcast_presence()
+
+    async def broadcast_presence(self):
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                'type': 'presence_update',
+                'miembros': await active_members(self.diagrama_id),
+            },
+        )
 
     async def receive_json(self, content, **kwargs):
         """Persiste y distribuye una actualizacion completa de React Flow."""
@@ -112,3 +172,9 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
                 'nodes': event['nodes'],
                 'edges': event['edges'],
             })
+
+    async def presence_update(self, event):
+        await self.send_json({
+            'type': 'presence.update',
+            'miembros': event['miembros'],
+        })
