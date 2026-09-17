@@ -23,7 +23,16 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
     serializer_class = DiagramaSerializer
 
     def get_queryset(self):
-        return self.allowed_diagrams()
+        queryset = self.allowed_diagrams()
+        proyecto_id = self.request.query_params.get('proyecto')
+
+        # El editor carga un proyecto a la vez. Aplicar el filtro en el
+        # servidor evita que diagramas de otros proyectos accesibles se
+        # mezclen al reabrir uno existente.
+        if proyecto_id:
+            queryset = queryset.filter(proyecto_id=proyecto_id)
+
+        return queryset
 
     def perform_create(self, serializer):
         project = serializer.validated_data['proyecto']

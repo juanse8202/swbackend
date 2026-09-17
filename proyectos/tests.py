@@ -43,6 +43,26 @@ class CollaborativeProjectTests(TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_diagrams_can_be_filtered_by_project(self):
+        self.project.colaboradores.add(self.first_user)
+        own_project = Proyecto.objects.create(
+            nombre='Proyecto propio', creador=self.first_user
+        )
+        own_diagram = Diagrama.objects.create(
+            proyecto=own_project, nombre='Diagrama propio'
+        )
+        self.client.force_login(self.first_user)
+
+        response = self.client.get(
+            f'/api/diagramas/diagramas/?proyecto={self.project.id}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        diagrams = response.json()
+        self.assertEqual([diagram['id'] for diagram in diagrams], [self.second_diagram.id])
+        self.assertEqual(diagrams[0]['proyecto'], self.project.id)
+        self.assertNotIn(own_diagram.id, [diagram['id'] for diagram in diagrams])
+
     def test_creator_can_create_project_and_invite_collaborator(self):
         self.client.force_login(self.first_user)
         create_response = self.client.post(
