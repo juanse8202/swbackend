@@ -1,0 +1,4 @@
+interface:
+  display_name: "DiagramCraft UML Relations"
+  short_description: "Integra relaciones UML en DiagramCraft"
+  default_prompt: "Usa $diagramcraft-uml-relations para implementar o corregir las relaciones UML de mi backend Django y frontend React Flow."
