@@ -64,6 +64,7 @@ class PresenciaDiagrama(models.Model):
     usuario = models.ForeignKey(User, on_delete=models.CASCADE)
     channel_name = models.CharField(max_length=255, unique=True)
     fecha_conexion = models.DateTimeField(auto_now_add=True)
+    fecha_actividad = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         indexes = [models.Index(fields=['diagrama', 'usuario'])]

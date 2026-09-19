@@ -23,7 +23,14 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
     serializer_class = DiagramaSerializer
 
     def get_queryset(self):
-        queryset = self.allowed_diagrams()
+        # Para mutaciones se resuelve primero el objeto y luego se aplica
+        # require_diagram_role: un colaborador expulsado recibe 403 en vez de
+        # un 404 ambiguo. Las lecturas ajenas siguen ocultándose con 404.
+        queryset = (
+            Diagrama.objects.all()
+            if self.action in {'update', 'partial_update', 'destroy'}
+            else self.allowed_diagrams()
+        )
         proyecto_id = self.request.query_params.get('proyecto')
         if proyecto_id:
             queryset = queryset.filter(proyecto_id=proyecto_id)

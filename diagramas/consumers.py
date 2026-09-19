@@ -1,5 +1,7 @@
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
+from datetime import timedelta
+from django.db.models import Q
 from django.utils import timezone
 
 from .models import Diagrama, PresenciaDiagrama
@@ -44,7 +46,11 @@ def save_diagram_if_user_can_access(user_id, diagram_id, nodes, edges):
 def register_presence(diagram_id, user_id, channel_name):
     PresenciaDiagrama.objects.update_or_create(
         channel_name=channel_name,
-        defaults={'diagrama_id': diagram_id, 'usuario_id': user_id},
+        defaults={
+            'diagrama_id': diagram_id,
+            'usuario_id': user_id,
+            'fecha_actividad': timezone.now(),
+        },
     )
 
 
@@ -54,7 +60,18 @@ def remove_presence(channel_name):
 
 
 @database_sync_to_async
+def touch_presence(channel_name):
+    return PresenciaDiagrama.objects.filter(channel_name=channel_name).update(
+        fecha_actividad=timezone.now()
+    ) > 0
+
+
+@database_sync_to_async
 def active_members(diagram_id):
+    cutoff = timezone.now() - timedelta(seconds=45)
+    PresenciaDiagrama.objects.filter(diagrama_id=diagram_id).filter(
+        Q(fecha_actividad__isnull=True) | Q(fecha_actividad__lt=cutoff)
+    ).delete()
     """Devuelve usuarios unicos, incluso si uno abrio varias pestañas."""
     members = []
     seen_user_ids = set()
@@ -97,18 +114,26 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
         await self.channel_layer.group_add(self.project_group_name, self.channel_name)
         await self.accept()
         await register_presence(self.diagrama_id, user.id, self.channel_name)
+        self.presence_active = True
         await self.broadcast_presence()
 
     async def disconnect(self, close_code):
         if hasattr(self, 'room_group_name'):
-            await remove_presence(self.channel_name)
+            await self.leave_presence()
             await self.channel_layer.group_discard(
                 self.room_group_name, self.channel_name
             )
             await self.channel_layer.group_discard(
                 self.project_group_name, self.channel_name
             )
-            await self.broadcast_presence()
+
+    async def leave_presence(self):
+        """Retira esta pestaña de presencia; es seguro llamarlo varias veces."""
+        if not getattr(self, 'presence_active', False):
+            return
+        await remove_presence(self.channel_name)
+        self.presence_active = False
+        await self.broadcast_presence()
 
     async def broadcast_presence(self):
         await self.channel_layer.group_send(
@@ -121,6 +146,15 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
 
     async def receive_json(self, content, **kwargs):
         """Persiste y distribuye una actualizacion completa de React Flow."""
+        if content.get('type') == 'presence.leave':
+            await self.leave_presence()
+            return
+
+        if content.get('type') == 'presence.heartbeat':
+            if await touch_presence(self.channel_name):
+                await self.broadcast_presence()
+            return
+
         if content.get('type') != 'diagram.update':
             await self.send_json({
                 'type': 'diagram.error',
@@ -159,6 +193,8 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
             await self.close(code=4403)
             return
 
+        await touch_presence(self.channel_name)
+
         await self.channel_layer.group_send(
             self.room_group_name,
             {
@@ -193,4 +229,12 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
             'proyecto_id': event['proyecto_id'],
             'invitacion_id': event['invitacion_id'],
             'miembro': event['miembro'],
+        })
+
+    async def member_removed(self, event):
+        await self.send_json({
+            'type': 'member.removed',
+            'proyecto_id': event['proyecto_id'],
+            'usuario_id': event['usuario_id'],
+            'detail': event['detail'],
         })

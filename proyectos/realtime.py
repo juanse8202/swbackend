@@ -14,3 +14,15 @@ def notify_invitation_accepted(*, proyecto_id, invitacion_id, miembro):
         'miembro': miembro,
     }
     async_to_sync(channel_layer.group_send)(f'project_{proyecto_id}', event)
+
+
+def notify_member_removed(*, proyecto_id, usuario_id,
+                          detail='El propietario te eliminó del proyecto.'):
+    """Notifica una expulsión únicamente a las conexiones del proyecto."""
+    channel_layer = get_channel_layer()
+    async_to_sync(channel_layer.group_send)(f'project_{proyecto_id}', {
+        'type': 'member_removed',
+        'proyecto_id': proyecto_id,
+        'usuario_id': usuario_id,
+        'detail': detail,
+    })

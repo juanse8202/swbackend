@@ -5,12 +5,12 @@ from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from .models import InvitacionProyecto, Proyecto, ProyectoMiembro
 from .permissions import require_owner
-from .realtime import notify_invitation_accepted
+from .realtime import notify_invitation_accepted, notify_member_removed
 from .serializers import InvitacionProyectoSerializer, ProyectoSerializer, UserSerializer
 from .services import create_project_with_main_diagram
 
@@ -25,15 +25,21 @@ class ProyectoViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        # Una membresía solo se crea al aceptar una invitación. Por tanto este
-        # queryset nunca expone invitaciones pendientes ni proyectos ajenos.
-        queryset = Proyecto.objects.filter(
-            Q(creador=user) | Q(miembros__usuario=user)
-        ).distinct()
+        archivados = self.request.query_params.get('archivados', '').lower() == 'true'
+
+        # La papelera es privada: un colaborador nunca puede ver, recuperar o
+        # borrar los proyectos archivados de su propietario.
+        if self.action == 'list' and archivados:
+            queryset = Proyecto.objects.filter(creador=user)
+        else:
+            # Una membresía solo se crea al aceptar una invitación. Por tanto
+            # este queryset nunca expone invitaciones pendientes ni ajenas.
+            queryset = Proyecto.objects.filter(
+                Q(creador=user) | Q(miembros__usuario=user)
+            ).distinct()
         # La eliminación definitiva se realiza desde la papelera, por eso debe
         # poder resolver un proyecto archivado aun si no vino el query param.
         if self.action not in {'destroy', 'restaurar'}:
-            archivados = self.request.query_params.get('archivados', '').lower() == 'true'
             queryset = queryset.filter(archivado=archivados)
         filtro = self.request.query_params.get('filtro')
         if filtro == 'mios':
@@ -138,11 +144,31 @@ class ProyectoViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def archivar(self, request, pk=None):
         proyecto = self.get_object()
         require_owner(request.user, proyecto)
+        # La papelera pertenece al propietario. Al archivar se descomparten
+        # los datos: una restauración posterior no reactiva colaboradores que
+        # ya no participan en el proyecto.
+        removed_user_ids = list(proyecto.miembros.exclude(
+            rol=ProyectoMiembro.Rol.PROPIETARIO
+        ).values_list('usuario_id', flat=True))
+        proyecto.miembros.exclude(rol=ProyectoMiembro.Rol.PROPIETARIO).delete()
+        proyecto.invitaciones.filter(
+            estado=InvitacionProyecto.Estado.PENDIENTE
+        ).update(
+            estado=InvitacionProyecto.Estado.RECHAZADA,
+            respondida_en=timezone.now(),
+        )
         proyecto.archivado = True
         proyecto.save(update_fields=['archivado', 'updated_at'])
+        for user_id in removed_user_ids:
+            transaction.on_commit(lambda user_id=user_id: notify_member_removed(
+                proyecto_id=proyecto.id,
+                usuario_id=user_id,
+                detail='El propietario archivó el proyecto y retiró tu acceso.',
+            ))
         return Response(ProyectoSerializer(proyecto, context={'request': request}).data)
 
     @action(detail=True, methods=['post'])
@@ -152,14 +178,35 @@ class ProyectoViewSet(viewsets.ModelViewSet):
         require_owner(request.user, proyecto)
         if not proyecto.archivado:
             raise ValidationError({'detail': 'El proyecto ya está activo.'})
-        proyecto.archivado = False
+        removed_user_ids = list(proyecto.miembros.exclude(
+            rol=ProyectoMiembro.Rol.PROPIETARIO
+        ).values_list('usuario_id', flat=True))
         try:
-            proyecto.save(update_fields=['archivado', 'updated_at'])
+            # Compatibilidad con proyectos archivados antes de que archivar
+            # empezara a descompartirlos. Una restauración siempre es privada.
+            with transaction.atomic():
+                proyecto.miembros.exclude(
+                    rol=ProyectoMiembro.Rol.PROPIETARIO
+                ).delete()
+                proyecto.invitaciones.filter(
+                    estado=InvitacionProyecto.Estado.PENDIENTE
+                ).update(
+                    estado=InvitacionProyecto.Estado.RECHAZADA,
+                    respondida_en=timezone.now(),
+                )
+                proyecto.archivado = False
+                proyecto.save(update_fields=['archivado', 'updated_at'])
         except IntegrityError:
             raise ValidationError({
                 'nombre': 'Ya tienes un proyecto activo con este nombre. '
                           'Renómbralo antes de restaurarlo.'
             })
+        for user_id in removed_user_ids:
+            transaction.on_commit(lambda user_id=user_id: notify_member_removed(
+                proyecto_id=proyecto.id,
+                usuario_id=user_id,
+                detail='El propietario restauró el proyecto sin colaboradores.',
+            ))
         return Response(ProyectoSerializer(proyecto, context={'request': request}).data)
 
     @action(detail=True, methods=['post'])
@@ -187,14 +234,30 @@ class ProyectoViewSet(viewsets.ModelViewSet):
         return Response(ProyectoSerializer(proyecto, context={'request': request}).data)
 
     @action(detail=True, methods=['delete'], url_path=r'colaboradores/(?P<usuario_id>[^/.]+)')
+    @transaction.atomic
     def quitar_colaborador(self, request, pk=None, usuario_id=None):
         proyecto = self.get_object()
-        require_owner(request.user, proyecto)
-        deleted, _ = proyecto.miembros.exclude(
-            rol=ProyectoMiembro.Rol.PROPIETARIO
-        ).filter(usuario_id=usuario_id).delete()
-        if not deleted:
+        try:
+            miembro = proyecto.miembros.get(usuario_id=usuario_id)
+        except ProyectoMiembro.DoesNotExist:
             raise ValidationError({'usuario': 'Ese usuario no es miembro del proyecto.'})
+
+        es_propietario = proyecto.creador_id == request.user.id
+        es_autosalir = miembro.usuario_id == request.user.id
+        if not es_propietario and not es_autosalir:
+            raise PermissionDenied('No tienes permiso para eliminar este colaborador.')
+        if es_propietario and es_autosalir:
+            raise ValidationError({
+                'detail': 'El propietario no puede abandonar su propio proyecto.'
+            })
+        if miembro.rol == ProyectoMiembro.Rol.PROPIETARIO:
+            raise ValidationError({'detail': 'No se puede eliminar al propietario.'})
+
+        removed_user_id = miembro.usuario_id
+        miembro.delete()
+        transaction.on_commit(lambda: notify_member_removed(
+            proyecto_id=proyecto.id, usuario_id=removed_user_id,
+        ))
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -206,7 +269,6 @@ class InvitacionProyectoViewSet(viewsets.GenericViewSet):
         # aceptar/rechazar pertenecen exclusivamente al invitado.
         if self.action in {'reenviar', 'destroy'}:
             return InvitacionProyecto.objects.filter(
-                proyecto__creador=self.request.user,
                 estado=InvitacionProyecto.Estado.PENDIENTE,
             ).select_related('proyecto', 'invitado')
         return InvitacionProyecto.objects.filter(
@@ -261,6 +323,7 @@ class InvitacionProyectoViewSet(viewsets.GenericViewSet):
         permite al cliente volver a notificarla dentro de la aplicación.
         """
         invitacion = self.get_object()
+        require_owner(request.user, invitacion.proyecto)
         invitacion.fecha = timezone.now()
         invitacion.save(update_fields=['fecha'])
         return Response(self.get_serializer(invitacion).data)
@@ -268,6 +331,7 @@ class InvitacionProyectoViewSet(viewsets.GenericViewSet):
     def destroy(self, request, *args, **kwargs):
         """Cancela una invitación pendiente emitida por el propietario."""
         invitacion = self.get_object()
+        require_owner(request.user, invitacion.proyecto)
         invitacion.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 

@@ -38,3 +38,11 @@ class ProyectoConsumer(AsyncJsonWebsocketConsumer):
             'invitacion_id': event['invitacion_id'],
             'miembro': event['miembro'],
         })
+
+    async def member_removed(self, event):
+        await self.send_json({
+            'type': 'member.removed',
+            'proyecto_id': event['proyecto_id'],
+            'usuario_id': event['usuario_id'],
+            'detail': event['detail'],
+        })

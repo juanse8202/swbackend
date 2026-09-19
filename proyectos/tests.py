@@ -180,6 +180,17 @@ class CollaborativeProjectTests(TestCase):
             {'usuario_id': self.first_user.id}, content_type='application/json',
         ).json()
 
+        self.client.force_login(self.first_user)
+        self.assertEqual(
+            self.client.post(f"/api/proyectos/invitaciones/{invitation['id']}/reenviar/").status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.delete(f"/api/proyectos/invitaciones/{invitation['id']}/").status_code,
+            403,
+        )
+
+        self.client.force_login(self.second_user)
         resend = self.client.post(f"/api/proyectos/invitaciones/{invitation['id']}/reenviar/")
         self.assertEqual(resend.status_code, 200)
         self.assertEqual(resend.json()['estado'], 'pendiente')
@@ -188,6 +199,58 @@ class CollaborativeProjectTests(TestCase):
 
         self.client.force_login(self.first_user)
         self.assertEqual(self.client.get('/api/proyectos/invitaciones/pendientes/').json(), [])
+
+    def test_trash_is_private_and_collaborator_cannot_restore(self):
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
+        self.client.force_login(self.second_user)
+        self.client.post(f'/api/proyectos/proyectos/{self.project.id}/archivar/')
+
+        self.client.force_login(self.first_user)
+        trash = self.client.get('/api/proyectos/proyectos/?archivados=true')
+        self.assertEqual(trash.status_code, 200)
+        self.assertEqual(trash.json(), [])
+        restore = self.client.post(f'/api/proyectos/proyectos/{self.project.id}/restaurar/')
+        self.assertEqual(restore.status_code, 403)
+
+    def test_removed_collaborator_loses_list_and_diagram_write_access(self):
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
+        self.client.force_login(self.second_user)
+        remove = self.client.delete(
+            f'/api/proyectos/proyectos/{self.project.id}/colaboradores/{self.first_user.id}/'
+        )
+        self.assertEqual(remove.status_code, 204)
+
+        self.client.force_login(self.first_user)
+        projects = self.client.get('/api/proyectos/proyectos/')
+        self.assertNotIn(self.project.id, [project['id'] for project in projects.json()])
+        patch = self.client.patch(
+            f'/api/diagramas/diagramas/{self.second_diagram.id}/',
+            {'nodes': []}, content_type='application/json',
+        )
+        self.assertEqual(patch.status_code, 403)
+
+    def test_collaborator_can_leave_but_owner_cannot_leave(self):
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
+        self.client.force_login(self.first_user)
+        leave = self.client.delete(
+            f'/api/proyectos/proyectos/{self.project.id}/colaboradores/{self.first_user.id}/'
+        )
+        self.assertEqual(leave.status_code, 204)
+        self.assertFalse(ProyectoMiembro.objects.filter(
+            proyecto=self.project, usuario=self.first_user
+        ).exists())
+
+        self.client.force_login(self.second_user)
+        owner_leave = self.client.delete(
+            f'/api/proyectos/proyectos/{self.project.id}/colaboradores/{self.second_user.id}/'
+        )
+        self.assertEqual(owner_leave.status_code, 400)
 
     def test_destroy_cascades_diagrams_members_and_invitations(self):
         invitation = InvitacionProyecto.objects.create(
@@ -228,6 +291,42 @@ class CollaborativeProjectTests(TestCase):
         self.assertEqual(restore_response.status_code, 200)
         self.assertFalse(restore_response.json()['archivado'])
         self.assertTrue(Proyecto.objects.get(pk=self.project.id).archivado is False)
+
+    def test_restore_does_not_restore_former_collaborators(self):
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
+        self.client.force_login(self.second_user)
+        self.assertEqual(
+            self.client.post(f'/api/proyectos/proyectos/{self.project.id}/archivar/').status_code,
+            200,
+        )
+        self.assertFalse(ProyectoMiembro.objects.filter(
+            proyecto=self.project, usuario=self.first_user
+        ).exists())
+        self.assertEqual(
+            self.client.post(f'/api/proyectos/proyectos/{self.project.id}/restaurar/').status_code,
+            200,
+        )
+
+        self.client.force_login(self.first_user)
+        projects = self.client.get('/api/proyectos/proyectos/').json()
+        self.assertNotIn(self.project.id, [project['id'] for project in projects])
+
+    def test_restore_cleans_collaborators_from_legacy_archived_project(self):
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
+        # Simula un proyecto archivado por una versión anterior del backend.
+        Proyecto.objects.filter(pk=self.project.id).update(archivado=True)
+        self.client.force_login(self.second_user)
+
+        response = self.client.post(f'/api/proyectos/proyectos/{self.project.id}/restaurar/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(ProyectoMiembro.objects.filter(
+            proyecto=self.project, usuario=self.first_user
+        ).exists())
 
     def test_reader_cannot_edit_diagram(self):
         ProyectoMiembro.objects.create(
