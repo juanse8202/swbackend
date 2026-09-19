@@ -2,8 +2,8 @@ from django.test import TestCase
 
 from django.contrib.auth import get_user_model
 
-from diagramas.models import Diagrama
-from .models import Proyecto, ProyectoMiembro
+from diagramas.models import ClaseUML, Diagrama, RelacionUML
+from .models import InvitacionProyecto, Proyecto, ProyectoMiembro
 
 
 class CollaborativeProjectTests(TestCase):
@@ -18,21 +18,14 @@ class CollaborativeProjectTests(TestCase):
         self.project = Proyecto.objects.create(nombre='Arquitectura', creador=self.second_user)
         self.second_diagram = Diagrama.objects.create(proyecto=self.project, nombre='Principal')
 
-    def test_registration_creates_a_private_personal_workspace(self):
+    def test_listing_does_not_create_a_personal_workspace(self):
         self.client.force_login(self.first_user)
         response = self.client.get('/api/proyectos/proyectos/')
         self.assertEqual(response.status_code, 200)
-        personal_projects = Proyecto.objects.filter(
+        self.assertEqual(response.json(), [])
+        self.assertFalse(Proyecto.objects.filter(
             creador=self.first_user, nombre='Mi lienzo personal'
-        )
-        self.assertEqual(personal_projects.count(), 1)
-        self.assertTrue(Diagrama.objects.filter(
-            proyecto=personal_projects.get(), nombre='Diagrama principal'
         ).exists())
-        personal_diagram = Diagrama.objects.get(proyecto=personal_projects.get())
-        self.assertEqual(personal_diagram.clases.count(), 2)
-        self.assertEqual(personal_diagram.relaciones.count(), 1)
-        self.assertNotIn(self.second_diagram.id, [item['id'] for item in response.json()])
 
     def test_user_cannot_access_another_users_diagram(self):
         self.client.force_login(self.first_user)
@@ -65,6 +58,34 @@ class CollaborativeProjectTests(TestCase):
         self.assertEqual(diagrams[0]['proyecto'], self.project.id)
         self.assertNotIn(own_diagram.id, [diagram['id'] for diagram in diagrams])
 
+    def test_project_list_includes_entity_and_relationship_totals(self):
+        origen = ClaseUML.objects.create(diagrama=self.second_diagram, nombre='Usuario')
+        destino = ClaseUML.objects.create(diagrama=self.second_diagram, nombre='Rol')
+        RelacionUML.objects.create(
+            diagrama=self.second_diagram, clase_origen=origen,
+            clase_destino=destino, tipo='Asociacion',
+        )
+        self.client.force_login(self.second_user)
+
+        response = self.client.get('/api/proyectos/proyectos/')
+
+        self.assertEqual(response.status_code, 200)
+        project = next(item for item in response.json() if item['id'] == self.project.id)
+        self.assertEqual(project['total_entidades'], 2)
+        self.assertEqual(project['total_relaciones'], 1)
+
+    def test_project_list_counts_react_flow_nodes_and_edges(self):
+        self.second_diagram.nodes = [{'id': str(index)} for index in range(3)]
+        self.second_diagram.edges = [{'id': '1-2'}]
+        self.second_diagram.save()
+        self.client.force_login(self.second_user)
+
+        response = self.client.get('/api/proyectos/proyectos/')
+
+        project = next(item for item in response.json() if item['id'] == self.project.id)
+        self.assertEqual(project['total_entidades'], 3)
+        self.assertEqual(project['total_relaciones'], 1)
+
     def test_creator_can_create_project_and_invite_collaborator(self):
         self.client.force_login(self.first_user)
         create_response = self.client.post(
@@ -78,18 +99,135 @@ class CollaborativeProjectTests(TestCase):
             f'/api/proyectos/proyectos/{project_id}/invitar/',
             {'email': self.second_user.email, 'rol': 'arquitecto'}, content_type='application/json'
         )
-        self.assertEqual(invite_response.status_code, 200)
-        self.assertIn(self.second_user.id, invite_response.json()['colaboradores'])
-        invited_member = next(
-            member for member in invite_response.json()['miembros']
-            if member['usuario']['id'] == self.second_user.id
-        )
-        self.assertEqual(invited_member['rol'], 'arquitecto')
+        self.assertEqual(invite_response.status_code, 201)
+        invitation_id = invite_response.json()['id']
+        self.assertEqual(invite_response.json()['estado'], 'pendiente')
+        self.assertEqual(invite_response.json()['rol'], 'arquitecto')
+
+        owner_projects = self.client.get('/api/proyectos/proyectos/').json()
+        owner_project = next(project for project in owner_projects if project['id'] == project_id)
+        self.assertEqual(owner_project['invitaciones_pendientes'], [{
+            'id': invitation_id,
+            'invitado': {
+                'id': self.second_user.id,
+                'username': self.second_user.username,
+                'email': self.second_user.email,
+            },
+            'rol': 'arquitecto',
+            'fecha': invite_response.json()['fecha'],
+            'estado': 'pendiente',
+        }])
 
         self.client.force_login(self.second_user)
+        pending_response = self.client.get('/api/proyectos/invitaciones/pendientes/')
+        self.assertEqual(pending_response.status_code, 200)
+        self.assertEqual(pending_response.json()[0]['id'], invitation_id)
+        accept_response = self.client.post(f'/api/proyectos/invitaciones/{invitation_id}/aceptar/')
+        self.assertEqual(accept_response.status_code, 200)
         diagrams_response = self.client.get('/api/diagramas/diagramas/')
         self.assertEqual(diagrams_response.status_code, 200)
         self.assertTrue(any(item['proyecto'] == project_id for item in diagrams_response.json()))
+
+    def test_creation_uses_the_authenticated_user_and_name_is_unique_per_owner(self):
+        self.client.force_login(self.first_user)
+        response = self.client.post(
+            '/api/proyectos/proyectos/',
+            # El campo de propietario se ignora aunque un cliente malicioso lo envíe.
+            {'nombre': 'SIG', 'creador': self.second_user.id},
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['propietario']['id'], self.first_user.id)
+        self.assertEqual(Proyecto.objects.get(pk=response.json()['id']).creador, self.first_user)
+
+        repeated = self.client.post(
+            '/api/proyectos/proyectos/', {'nombre': 'sig'}, content_type='application/json'
+        )
+        self.assertEqual(repeated.status_code, 400)
+        self.assertIn('nombre', repeated.json())
+
+        self.client.force_login(self.second_user)
+        other_owner = self.client.post(
+            '/api/proyectos/proyectos/', {'nombre': 'SIG'}, content_type='application/json'
+        )
+        self.assertEqual(other_owner.status_code, 201)
+        self.assertEqual(other_owner.json()['propietario']['id'], self.second_user.id)
+
+    def test_projects_are_isolated_until_an_invitation_is_accepted(self):
+        self.client.force_login(self.first_user)
+        self.assertNotIn(
+            self.project.id,
+            [project['id'] for project in self.client.get('/api/proyectos/proyectos/').json()],
+        )
+
+        self.client.force_login(self.second_user)
+        invite_response = self.client.post(
+            f'/api/proyectos/proyectos/{self.project.id}/invitar/',
+            {'usuario_id': self.first_user.id}, content_type='application/json',
+        )
+        invitation_id = invite_response.json()['id']
+        self.client.force_login(self.first_user)
+        self.client.post(f'/api/proyectos/invitaciones/{invitation_id}/aceptar/')
+        self.assertIn(
+            self.project.id,
+            [project['id'] for project in self.client.get('/api/proyectos/proyectos/').json()],
+        )
+
+    def test_owner_can_resend_or_cancel_a_pending_invitation(self):
+        self.client.force_login(self.second_user)
+        invitation = self.client.post(
+            f'/api/proyectos/proyectos/{self.project.id}/invitar/',
+            {'usuario_id': self.first_user.id}, content_type='application/json',
+        ).json()
+
+        resend = self.client.post(f"/api/proyectos/invitaciones/{invitation['id']}/reenviar/")
+        self.assertEqual(resend.status_code, 200)
+        self.assertEqual(resend.json()['estado'], 'pendiente')
+        cancel = self.client.delete(f"/api/proyectos/invitaciones/{invitation['id']}/")
+        self.assertEqual(cancel.status_code, 204)
+
+        self.client.force_login(self.first_user)
+        self.assertEqual(self.client.get('/api/proyectos/invitaciones/pendientes/').json(), [])
+
+    def test_destroy_cascades_diagrams_members_and_invitations(self):
+        invitation = InvitacionProyecto.objects.create(
+            proyecto=self.project, invitador=self.second_user, invitado=self.first_user,
+            rol=ProyectoMiembro.Rol.EDITOR,
+        )
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.EDITOR
+        )
+        self.client.force_login(self.second_user)
+        response = self.client.delete(f'/api/proyectos/proyectos/{self.project.id}/')
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Proyecto.objects.filter(pk=self.project.id).exists())
+        self.assertFalse(Diagrama.objects.filter(pk=self.second_diagram.id).exists())
+        self.assertFalse(ProyectoMiembro.objects.filter(proyecto_id=self.project.id).exists())
+        self.assertFalse(InvitacionProyecto.objects.filter(pk=invitation.id).exists())
+
+    def test_archive_duplicate_and_filters(self):
+        self.client.force_login(self.second_user)
+        duplicate_response = self.client.post(
+            f'/api/proyectos/proyectos/{self.project.id}/duplicar/'
+        )
+        self.assertEqual(duplicate_response.status_code, 201)
+        copy_id = duplicate_response.json()['id']
+        self.assertEqual(Diagrama.objects.filter(proyecto_id=copy_id).count(), 1)
+
+        archive_response = self.client.post(
+            f'/api/proyectos/proyectos/{self.project.id}/archivar/'
+        )
+        self.assertEqual(archive_response.status_code, 200)
+        self.assertTrue(archive_response.json()['archivado'])
+        trash_response = self.client.get('/api/proyectos/proyectos/?archivados=true')
+        self.assertEqual([project['id'] for project in trash_response.json()], [self.project.id])
+
+        restore_response = self.client.post(
+            f'/api/proyectos/proyectos/{self.project.id}/restaurar/'
+        )
+        self.assertEqual(restore_response.status_code, 200)
+        self.assertFalse(restore_response.json()['archivado'])
+        self.assertTrue(Proyecto.objects.get(pk=self.project.id).archivado is False)
 
     def test_reader_cannot_edit_diagram(self):
         ProyectoMiembro.objects.create(

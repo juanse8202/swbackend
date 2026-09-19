@@ -45,6 +45,14 @@ class SessionLoginTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["email"], "ana@example.com")
 
+    def test_logout_invalidates_the_server_session(self):
+        self.client.force_login(self.user)
+
+        response = self.client.post('/api/logout/')
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.client.get('/api/me/').status_code, 403)
+
 
 class RegistrationTests(TestCase):
     def test_registration_generates_unique_username_from_email(self):

@@ -191,7 +191,12 @@ LOGOUT_REDIRECT_URL = LOGIN_REDIRECT_URL
 SOCIALACCOUNT_PROVIDERS = {
     'google': {
         'SCOPE': ['profile', 'email'],
-        'AUTH_PARAMS': {'access_type': 'online'},
+        # Evita que Google reutilice silenciosamente la última cuenta del
+        # navegador y permite escoger la cuenta de DiagramCraft.
+        'AUTH_PARAMS': {
+            'access_type': 'online',
+            'prompt': 'select_account',
+        },
     },
     'github': {
         'SCOPE': ['user:email'],

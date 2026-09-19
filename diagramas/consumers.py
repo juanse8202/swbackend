@@ -7,11 +7,11 @@ from proyectos.models import ProyectoMiembro
 
 
 @database_sync_to_async
-def user_can_access_diagram(user_id, diagram_id):
+def project_for_authorized_diagram(user_id, diagram_id):
     return Diagrama.objects.filter(
         proyecto__miembros__usuario_id=user_id,
         pk=diagram_id,
-    ).exists()
+    ).values_list('proyecto_id', flat=True).first()
 
 
 @database_sync_to_async
@@ -83,13 +83,18 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
             await self.close(code=4401)
             return
 
-        if not await user_can_access_diagram(user.id, self.diagrama_id):
+        self.proyecto_id = await project_for_authorized_diagram(user.id, self.diagrama_id)
+        if self.proyecto_id is None:
             await self.close(code=4403)
             return
 
         # Todas las conexiones del mismo lienzo deben usar el mismo grupo.
         self.room_group_name = f'diagram_{self.diagrama_id}'
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+        # Un solo socket del lienzo también recibe eventos del proyecto, como
+        # la aceptación de invitaciones, sin abrir otra conexión en el cliente.
+        self.project_group_name = f'project_{self.proyecto_id}'
+        await self.channel_layer.group_add(self.project_group_name, self.channel_name)
         await self.accept()
         await register_presence(self.diagrama_id, user.id, self.channel_name)
         await self.broadcast_presence()
@@ -99,6 +104,9 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
             await remove_presence(self.channel_name)
             await self.channel_layer.group_discard(
                 self.room_group_name, self.channel_name
+            )
+            await self.channel_layer.group_discard(
+                self.project_group_name, self.channel_name
             )
             await self.broadcast_presence()
 
@@ -177,4 +185,12 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
         await self.send_json({
             'type': 'presence.update',
             'miembros': event['miembros'],
+        })
+
+    async def invitation_accepted(self, event):
+        await self.send_json({
+            'type': 'invitation.accepted',
+            'proyecto_id': event['proyecto_id'],
+            'invitacion_id': event['invitacion_id'],
+            'miembro': event['miembro'],
         })

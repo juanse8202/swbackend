@@ -20,12 +20,13 @@ from channels.auth import AuthMiddlewareStack
 from channels.routing import ProtocolTypeRouter, URLRouter
 
 import diagramas.routing
+import proyectos.routing
 
 application = ProtocolTypeRouter({
     "http": django_asgi_application,
     "websocket": AuthMiddlewareStack(
         URLRouter(
-            diagramas.routing.websocket_urlpatterns
+            diagramas.routing.websocket_urlpatterns + proyectos.routing.websocket_urlpatterns
         )
     ),
 })
