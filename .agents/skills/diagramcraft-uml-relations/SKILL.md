@@ -1,6 +1,6 @@
 ---
 name: diagramcraft-uml-relations
-description: Implement, integrate, debug, or extend UML class relationships in the DiagramCraft Django REST backend and React Flow/Zustand frontend. Use for association, aggregation, composition, inheritance, realization, dependency, multiplicities, edge rendering, persistence, permissions, and backend/frontend synchronization in this specific project.
+description: Implement, integrate, debug, or extend UML class relationships in the DiagramCraft Django REST backend and React Flow/Zustand frontend. Use for association, aggregation, composition, inheritance, realization, dependency, association classes, multiplicities, edge rendering, persistence, permissions, and backend/frontend synchronization in this specific project.
 ---
 
 # DiagramCraft UML Relations
@@ -40,6 +40,17 @@ Support these UML values consistently across backend and frontend:
 Use stable lowercase machine values and Spanish display labels. Migrate legacy Django values such as `Asociacion` and legacy JPA edge types such as `oneToMany` deliberately; never reinterpret stored values without a data migration or compatibility mapper.
 
 Keep UML semantics separate from JPA cardinality. Association, aggregation, composition, inheritance, realization, and dependency define the line/endpoint notation. `1`, `0..1`, `0..*`, and `1..*` define multiplicity. `@OneToMany` and similar annotations are derived JPA metadata, not UML relationship types.
+
+## Association classes
+
+An association with attributes or methods of its own is an association class. For example, `NotaVenta` and `Producto` may have a many-to-many association whose association class `DetalleVenta` owns `cantidad` and `precio`.
+
+- Do not silently model this as a plain `@ManyToMany`: its attributes would be lost.
+- Represent the association class explicitly as a normal class/entity node with a stable ID and preserve its link to the base association in edge metadata, for example `data.associationClassNodeId`. Render the UML association-class connector separately from the two endpoint associations.
+- Validate that the association class and both endpoint nodes belong to the same diagram. The association class must not replace or ambiguously attach to unrelated edges.
+- For Spring/JPA generation, emit the association class as its own entity with two `@ManyToOne` fields (to `NotaVenta` and `Producto`), and optional inverse `@OneToMany` collections. Apply a unique constraint to the endpoint pair when the domain requires at most one detail per pair.
+- Keep multiplicities explicit. A common model is `NotaVenta 1 -- 0..* DetalleVenta` and `Producto 1 -- 0..* DetalleVenta`; do not infer cascade, orphan removal, or composite keys unless the diagram or project policy explicitly requests them.
+- Deleting an endpoint or base association must warn about the associated class and linked edges. Preserve autosave, undo/redo, role checks, reload behavior, and WebSocket synchronization.
 
 ## Implementation requirements
 

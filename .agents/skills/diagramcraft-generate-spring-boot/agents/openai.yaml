@@ -1,0 +1,15 @@
+interface:
+  display_name: DiagramCraft Spring Boot Generator
+  short_description: Genera Spring Boot desde el JSON UML de DiagramCraft.
+  default_prompt: Implementa de extremo a extremo el generador Spring Boot usando
+    Diagrama.nodes y Diagrama.edges como fuente de verdad, normalización UML en memoria,
+    validación Django y controles React.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
