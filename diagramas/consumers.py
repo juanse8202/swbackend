@@ -146,6 +146,18 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
 
     async def receive_json(self, content, **kwargs):
         """Persiste y distribuye una actualizacion completa de React Flow."""
+        if content.get('type') == 'presence.join':
+            # El cliente anuncia su entrada al abrir o reconectar el socket.
+            # connect() ya registra la presencia, pero tratar este evento como
+            # idempotente evita falsos errores de sincronizacion y permite que
+            # una pestaña que antes envio presence.leave vuelva a anunciarse.
+            await register_presence(
+                self.diagrama_id, self.scope['user'].id, self.channel_name
+            )
+            self.presence_active = True
+            await self.broadcast_presence()
+            return
+
         if content.get('type') == 'presence.leave':
             await self.leave_presence()
             return
