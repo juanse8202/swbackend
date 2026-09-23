@@ -1,0 +1,14 @@
+interface:
+  display_name: DiagramCraft IA y voz
+  short_description: Integra Gemini y comandos de voz en DiagramCraft
+  default_prompt: Usa $diagramcraft-ai-voice para implementar IA con comandos de voz
+    en mi editor UML Django y React.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

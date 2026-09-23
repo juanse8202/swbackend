@@ -213,3 +213,10 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS
+
+# Solo el backend consume estas variables. Nunca se exponen al navegador.
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+AI_REQUEST_TIMEOUT_SECONDS = int(os.getenv('AI_REQUEST_TIMEOUT_SECONDS', '20'))
+AI_MAX_OPERATIONS = int(os.getenv('AI_MAX_OPERATIONS', '10'))
+AI_PLAN_TTL_SECONDS = int(os.getenv('AI_PLAN_TTL_SECONDS', '600'))

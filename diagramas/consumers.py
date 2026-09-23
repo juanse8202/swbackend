@@ -1,10 +1,12 @@
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from datetime import timedelta
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
 from .models import Diagrama, PresenciaDiagrama
+from .serializers import DiagramaSerializer
 from proyectos.models import ProyectoMiembro
 
 
@@ -18,28 +20,33 @@ def project_for_authorized_diagram(user_id, diagram_id):
 
 @database_sync_to_async
 def save_diagram_if_user_can_access(user_id, diagram_id, nodes, edges):
-    """Guarda el lienzo solo si el usuario sigue perteneciendo al proyecto."""
-    diagram = Diagrama.objects.filter(pk=diagram_id).first()
-    if diagram is None:
-        return False
-    try:
-        membership = diagram.proyecto.miembros.get(usuario_id=user_id)
-    except ProyectoMiembro.DoesNotExist:
-        return False
-    if membership.rol not in {
-        ProyectoMiembro.Rol.PROPIETARIO,
-        ProyectoMiembro.Rol.ARQUITECTO,
-        ProyectoMiembro.Rol.EDITOR,
-    }:
-        return False
-    if membership.rol == ProyectoMiembro.Rol.EDITOR and diagram.edges != edges:
-        return False
-
-    return Diagrama.objects.filter(pk=diagram_id).update(
-        nodes=nodes,
-        edges=edges,
-        fecha_modificacion=timezone.now(),
-    ) > 0
+    """Validate and save a complete canvas under a row lock, with revision."""
+    with transaction.atomic():
+        diagram = Diagrama.objects.select_for_update().filter(pk=diagram_id).first()
+        if diagram is None:
+            return None
+        try:
+            membership = diagram.proyecto.miembros.get(usuario_id=user_id)
+        except ProyectoMiembro.DoesNotExist:
+            return None
+        if membership.rol not in {
+            ProyectoMiembro.Rol.PROPIETARIO,
+            ProyectoMiembro.Rol.ARQUITECTO,
+            ProyectoMiembro.Rol.EDITOR,
+        }:
+            return None
+        if membership.rol == ProyectoMiembro.Rol.EDITOR and diagram.edges != edges:
+            return None
+        serializer = DiagramaSerializer(diagram, data={'nodes': nodes, 'edges': edges}, partial=True)
+        if not serializer.is_valid():
+            return None
+        if diagram.nodes == nodes and diagram.edges == edges:
+            return diagram.revision
+        diagram.nodes = nodes
+        diagram.edges = edges
+        diagram.revision += 1
+        diagram.save(update_fields=['nodes', 'edges', 'revision', 'fecha_modificacion'])
+        return diagram.revision
 
 
 @database_sync_to_async
@@ -194,10 +201,10 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
 
         # El permiso se comprueba tambien en cada escritura, por si el
         # colaborador fue retirado despues de abrir el WebSocket.
-        was_saved = await save_diagram_if_user_can_access(
+        revision = await save_diagram_if_user_can_access(
             self.scope['user'].id, self.diagrama_id, nodes, edges
         )
-        if not was_saved:
+        if revision is None:
             await self.send_json({
                 'type': 'diagram.error',
                 'detail': 'No tienes permiso para editar este diagrama.',
@@ -214,6 +221,7 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
                 'diagram_id': self.diagrama_id,
                 'nodes': nodes,
                 'edges': edges,
+                'revision': revision,
                 'sender_channel_name': self.channel_name,
             },
         )
@@ -227,6 +235,7 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
                 'diagram_id': event['diagram_id'],
                 'nodes': event['nodes'],
                 'edges': event['edges'],
+                'revision': event.get('revision'),
             })
 
     async def presence_update(self, event):

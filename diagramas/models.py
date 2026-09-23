@@ -1,5 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
+from uuid import uuid4
 
 class Diagrama(models.Model):
     proyecto = models.ForeignKey('proyectos.Proyecto', on_delete=models.CASCADE, related_name='diagramas')
@@ -8,11 +9,37 @@ class Diagrama(models.Model):
     # estilos, posiciones y datos propios de los nodos sin perderlos al recargar.
     nodes = models.JSONField(default=list, blank=True)
     edges = models.JSONField(default=list, blank=True)
+    revision = models.PositiveBigIntegerField(default=0)
     fecha_creacion = models.DateTimeField(auto_now_add=True)
     fecha_modificacion = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return self.nombre
+
+
+class PlanIA(models.Model):
+    """A short-lived, server-owned plan; clients never submit operations to apply."""
+
+    class Estado(models.TextChoices):
+        PENDIENTE = 'pending', 'Pendiente'
+        APLICADO = 'applied', 'Aplicado'
+        EXPIRADO = 'expired', 'Expirado'
+
+    plan_id = models.UUIDField(default=uuid4, unique=True, editable=False)
+    diagrama = models.ForeignKey(Diagrama, on_delete=models.CASCADE, related_name='planes_ia')
+    usuario = models.ForeignKey(User, on_delete=models.CASCADE, related_name='planes_ia')
+    operaciones = models.JSONField()
+    revision_base = models.PositiveBigIntegerField()
+    request_hash = models.CharField(max_length=64)
+    expira_en = models.DateTimeField()
+    estado = models.CharField(max_length=12, choices=Estado.choices, default=Estado.PENDIENTE)
+    idempotency_key = models.CharField(max_length=128, blank=True, default='')
+    resultado = models.JSONField(null=True, blank=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_aplicacion = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['diagrama', 'usuario', 'estado'])]
 
 class ClaseUML(models.Model):
     diagrama = models.ForeignKey(Diagrama, on_delete=models.CASCADE, related_name='clases')

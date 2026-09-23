@@ -1,7 +1,9 @@
+from django.db import transaction
 from django.http import HttpResponse
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
+from rest_framework.response import Response
 
 from proyectos.models import ProyectoMiembro
 from proyectos.permissions import EDIT_ROLES, require_role, role_for
@@ -12,6 +14,12 @@ from .serializers import (
 )
 from .spring_generator import DiagramGenerationError, generate_spring_boot_zip
 from .xmi import XmiError, export_xmi, parse_xmi
+from .ai_interpreter import (
+    AiInterpretationError, AiProviderError, build_diagram_summary, get_ai_provider,
+    validate_interpret_request, validate_provider_response,
+)
+from .ai_operations import OperationError, execute_operations
+from .ai_plans import PlanError, apply_plan, create_plan
 
 
 class DiagramAccessMixin:
@@ -49,33 +57,40 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         serializer.save()
 
     def perform_update(self, serializer):
-        self.require_diagram_role(serializer.instance, EDIT_ROLES)
-        if (
-            role_for(self.request.user, serializer.instance.proyecto)
-            == ProyectoMiembro.Rol.EDITOR
-            and 'edges' in serializer.validated_data
-            and serializer.validated_data['edges'] != serializer.instance.edges
-        ):
-            require_role(
-                self.request.user,
-                serializer.instance.proyecto,
-                {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
-                'Solo un arquitecto puede modificar relaciones.',
+        original_id = serializer.instance.pk
+        with transaction.atomic():
+            locked = Diagrama.objects.select_for_update().get(pk=original_id)
+            serializer.instance = locked
+            self.require_diagram_role(locked, EDIT_ROLES)
+            document_changed = any(
+                field in serializer.validated_data and serializer.validated_data[field] != getattr(locked, field)
+                for field in ('nodes', 'edges')
             )
-        if (
-            serializer.instance.proyecto_id != serializer.validated_data.get(
-                'proyecto', serializer.instance.proyecto
-            ).id
-        ):
-            self.require_diagram_role(
-                serializer.instance,
-                {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
-            )
-            require_role(
-                self.request.user, serializer.validated_data['proyecto'],
-                {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
-            )
-        serializer.save()
+            if (
+                role_for(self.request.user, locked.proyecto)
+                == ProyectoMiembro.Rol.EDITOR
+                and 'edges' in serializer.validated_data
+                and serializer.validated_data['edges'] != locked.edges
+            ):
+                require_role(
+                    self.request.user,
+                    locked.proyecto,
+                    {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+                    'Solo un arquitecto puede modificar relaciones.',
+                )
+            if (
+                locked.proyecto_id != serializer.validated_data.get('proyecto', locked.proyecto).id
+            ):
+                self.require_diagram_role(
+                    locked,
+                    {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+                )
+                require_role(
+                    self.request.user, serializer.validated_data['proyecto'],
+                    {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+                )
+            serializer.save(revision=locked.revision + 1 if document_changed else locked.revision)
+        return
 
     def perform_destroy(self, instance):
         self.require_diagram_role(
@@ -83,6 +98,62 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
             {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
         )
         instance.delete()
+
+    @action(detail=True, methods=['post'], url_path='interpretar-ia')
+    def interpretar_ia(self, request, pk=None):
+        """Interpret text into a validated, non-persisted modelling plan."""
+        diagram = self.get_object()
+        self.require_diagram_role(diagram, EDIT_ROLES)
+        try:
+            instruction, selection = validate_interpret_request(
+                request.data, diagram.nodes, diagram.edges
+            )
+            context = build_diagram_summary(diagram.nodes, diagram.edges, selection)
+            context['instruction'] = instruction
+            proposal = validate_provider_response(
+                get_ai_provider().interpret(context), diagram.nodes, diagram.edges
+            )
+            if proposal['status'] != 'ready':
+                return Response({
+                    'status': proposal['status'], 'summary': proposal['summary'],
+                    'question': proposal['question'], 'candidates': proposal['candidates'],
+                    'operations': [],
+                })
+            candidate = execute_operations(diagram.nodes, diagram.edges, proposal['operations'])
+            if candidate['edges'] != diagram.edges:
+                self.require_diagram_role(
+                    diagram,
+                    {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+                    'Solo un arquitecto puede proponer cambios de relaciones.',
+                )
+        except (AiInterpretationError, AiProviderError, OperationError) as error:
+            raise ValidationError({'ai': str(error)}) from error
+
+        # Gemini has finished before this write; a plan is bound to the
+        # current revision and cannot be replaced by client-provided operations.
+        diagram.refresh_from_db(fields=['revision'])
+        plan = create_plan(user=request.user, diagram=diagram, operations=proposal['operations'])
+        return Response({
+            'status': 'ready', 'plan_id': str(plan.plan_id), 'base_revision': plan.revision_base,
+            'summary': proposal['summary'],
+            'operations': proposal['operations'],
+            'requires_confirmation': any(
+                operation.get('op') in {'delete_node', 'delete_relation'}
+                for operation in proposal['operations']
+            ),
+        })
+
+    @action(detail=True, methods=['post'], url_path='aplicar-plan-ia')
+    def aplicar_plan_ia(self, request, pk=None):
+        """Commit a stored plan; the request can never supply operations."""
+        # Access filtering happens in get_object. apply_plan locks and checks
+        # membership again inside the transaction before any write.
+        self.get_object()
+        try:
+            result = apply_plan(user=request.user, diagram_id=pk, payload=request.data)
+        except PlanError as error:
+            raise ValidationError({'ai': str(error)}) from error
+        return Response(result)
 
     @action(detail=True, methods=['post'], url_path='generar-spring-boot')
     def generar_spring_boot(self, request, pk=None):
@@ -125,12 +196,15 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
             imported = parse_xmi(upload.read())
         except XmiError as error:
             raise ValidationError({'errors': [error.error]}) from error
-        # Validate the complete candidate before changing the persisted canvas.
-        serializer = self.get_serializer(
-            diagram, data={'nodes': imported['nodes'], 'edges': imported['edges']}, partial=True
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        # Validate and replace under a row lock so a concurrent plan becomes
+        # stale instead of silently overwriting an import.
+        with transaction.atomic():
+            diagram = Diagrama.objects.select_for_update().get(pk=diagram.pk)
+            serializer = self.get_serializer(
+                diagram, data={'nodes': imported['nodes'], 'edges': imported['edges']}, partial=True
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save(revision=diagram.revision + 1)
         return HttpResponse(
             __import__('json').dumps({
                 'nodes': serializer.instance.nodes, 'edges': serializer.instance.edges,

@@ -3,13 +3,33 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from io import BytesIO
 from zipfile import ZipFile
+from copy import deepcopy
+from datetime import timedelta
+from unittest.mock import patch
 
 from lxml import etree
+from django.utils import timezone
 
 from proyectos.models import Proyecto, ProyectoMiembro
-from .models import Diagrama
+from .models import Diagrama, PlanIA
+from .ai_operations import OperationError, execute_operations
+from .ai_interpreter import AiProviderError
+from .ai_plans import create_plan
 from .spring_generator import generate_spring_boot_zip
 from .xmi import UMLDI, XMI, XmiError, export_xmi, parse_xmi
+
+
+class FakeAiProvider:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.contexts = []
+
+    def interpret(self, context):
+        self.contexts.append(context)
+        if self.error:
+            raise self.error
+        return self.response
 
 
 class DiagramUmlContractTests(TestCase):
@@ -48,6 +68,276 @@ class DiagramUmlContractTests(TestCase):
             {'nodes': nodes, 'edges': edges},
             content_type='application/json',
         )
+
+    def test_ai_operations_create_update_move_attributes_and_relations(self):
+        nodes = [self.node('cliente', 'entity'), self.node('pedido', 'entity')]
+        candidate = execute_operations(nodes, [], [
+            {'op': 'update_node', 'node_id': 'cliente', 'patch': {'title': 'Persona'}},
+            {'op': 'move_node', 'node_id': 'cliente', 'position': {'x': 250, 'y': 80}},
+            {'op': 'add_attribute', 'node_id': 'cliente',
+             'attribute': {'name': 'nombre', 'type': 'String', 'visibility': 'private'}},
+            {'op': 'update_attribute', 'node_id': 'cliente', 'attribute_name': 'nombre',
+             'attribute': {'name': 'nombreCompleto', 'type': 'String'}},
+            {'op': 'create_relation', 'source': 'cliente', 'target': 'pedido',
+             'relation_type': 'asociacion',
+             'data': {'multiplicidadOrigen': '1', 'multiplicidadDestino': '*',
+                      'ownerNodeId': 'cliente', 'umlLabel': 'realiza'}},
+        ])
+        cliente = next(node for node in candidate['nodes'] if node['id'] == 'cliente')
+        self.assertEqual(cliente['data']['title'], 'Persona.java')
+        self.assertEqual(cliente['position'], {'x': 250, 'y': 80})
+        self.assertIn('nombreCompleto', [item['name'] for item in cliente['data']['properties']])
+        self.assertEqual(candidate['edges'][0]['data']['umlLabel'], 'realiza')
+
+        candidate = execute_operations(candidate['nodes'], candidate['edges'], [
+            {'op': 'update_relation', 'edge_id': candidate['edges'][0]['id'],
+             'data': {'multiplicidadDestino': '0..*'}},
+            {'op': 'delete_relation', 'edge_id': candidate['edges'][0]['id']},
+            {'op': 'remove_attribute', 'node_id': 'cliente', 'attribute_name': 'nombreCompleto'},
+        ])
+        self.assertEqual(candidate['edges'], [])
+        cliente = next(node for node in candidate['nodes'] if node['id'] == 'cliente')
+        self.assertNotIn('nombreCompleto', [item['name'] for item in cliente['data']['properties']])
+
+    def test_ai_operations_support_temp_references_and_cascade_delete(self):
+        candidate = execute_operations([], [], [
+            {'op': 'create_node', 'temp_id': '$pedido', 'kind': 'entity', 'title': 'Pedido'},
+            {'op': 'create_node', 'temp_id': '$detalle', 'kind': 'entity', 'title': 'DetallePedido'},
+            {'op': 'create_relation', 'source': '$detalle', 'target': '$pedido',
+             'relation_type': 'composicion',
+             'data': {'multiplicidadOrigen': '1..*', 'multiplicidadDestino': '1',
+                      'wholeNodeId': '$pedido', 'ownerNodeId': '$pedido',
+                      'relationConvention': 'target-whole-v1'}},
+        ])
+        # References in relation metadata are explicit IDs, never unresolved temporary aliases.
+        relation = candidate['edges'][0]
+        self.assertEqual(relation['data']['wholeNodeId'], relation['target'])
+        with self.assertRaises(OperationError):
+            execute_operations(candidate['nodes'], candidate['edges'], [
+                {'op': 'delete_node', 'node_id': relation['target']},
+            ])
+        candidate = execute_operations(candidate['nodes'], candidate['edges'], [
+            {'op': 'delete_node', 'node_id': relation['target'], 'cascade_incident': True},
+        ])
+        self.assertEqual(len(candidate['nodes']), 1)
+        self.assertEqual(candidate['edges'], [])
+
+    def test_ai_operations_reject_invalid_batches_without_mutating_inputs(self):
+        nodes = [self.node('cliente', 'entity')]
+        original_nodes = deepcopy(nodes)
+        with self.assertRaises(OperationError):
+            execute_operations(nodes, [], [
+                {'op': 'add_attribute', 'node_id': 'cliente',
+                 'attribute': {'name': 'correo', 'type': 'String'}},
+                {'op': 'create_relation', 'source': 'cliente', 'target': 'missing',
+                 'relation_type': 'asociacion'},
+            ])
+        self.assertEqual(nodes, original_nodes)
+        with self.assertRaises(OperationError):
+            execute_operations(nodes, [], [
+                {'op': 'move_node', 'node_id': 'cliente',
+                 'position': {'x': 0, 'y': 0}, 'unsafe': 'ignored'},
+            ])
+
+    def test_ai_interpretation_returns_valid_plan_without_persisting(self):
+        self.diagram.nodes = [self.node('cliente', 'entity')]
+        self.diagram.save()
+        provider = FakeAiProvider({
+            'status': 'ready', 'summary': 'Renombrar Cliente.', 'question': '', 'candidates': [],
+            'operations': [{'op': 'update_node', 'node_id': 'cliente',
+                            'patch': {'title': 'Persona'}}],
+        })
+        with patch('diagramas.views.get_ai_provider', return_value=provider):
+            response = self.client.post(
+                f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+                {'instruction': 'Renombra Cliente a Persona',
+                 'selection': {'node_ids': ['cliente'], 'edge_ids': []}},
+                content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'ready')
+        self.assertIn('plan_id', response.json())
+        self.assertEqual(provider.contexts[0]['selection']['node_ids'], ['cliente'])
+        self.diagram.refresh_from_db()
+        self.assertEqual(self.diagram.nodes[0]['data']['title'], 'cliente.java')
+        self.assertEqual(PlanIA.objects.filter(diagrama=self.diagram).count(), 1)
+
+    def test_ai_interpretation_returns_clarification_without_mutation(self):
+        self.diagram.nodes = [self.node('cliente-a', 'entity'), self.node('cliente-b', 'entity')]
+        self.diagram.save()
+        provider = FakeAiProvider({
+            'status': 'clarification', 'summary': '', 'question': 'Cual Cliente?',
+            'candidates': ['cliente-a', 'cliente-b'], 'operations': [],
+        })
+        with patch('diagramas.views.get_ai_provider', return_value=provider):
+            response = self.client.post(
+                f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+                {'instruction': 'Renombra Cliente'}, content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'clarification')
+        self.diagram.refresh_from_db()
+        self.assertEqual(len(self.diagram.nodes), 2)
+
+    def test_ai_interpretation_rejects_invalid_provider_payload_and_errors(self):
+        self.diagram.nodes = [self.node('cliente', 'entity')]
+        self.diagram.save()
+        invalid = FakeAiProvider({
+            'status': 'ready', 'summary': 'x', 'question': '', 'candidates': [],
+            'operations': [{'op': 'eval', 'source': 'cliente'}],
+        })
+        with patch('diagramas.views.get_ai_provider', return_value=invalid):
+            invalid_response = self.client.post(
+                f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+                {'instruction': 'haz algo'}, content_type='application/json',
+            )
+        self.assertEqual(invalid_response.status_code, 400)
+        failing = FakeAiProvider(error=AiProviderError('network'))
+        with patch('diagramas.views.get_ai_provider', return_value=failing):
+            failure_response = self.client.post(
+                f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+                {'instruction': 'haz algo'}, content_type='application/json',
+            )
+        self.assertEqual(failure_response.status_code, 400)
+        self.diagram.refresh_from_db()
+        self.assertEqual(self.diagram.nodes[0]['id'], 'cliente')
+
+    def test_ai_interpretation_requires_edit_permission_and_strict_request(self):
+        reader = get_user_model().objects.create_user(username='lector-ia', password='clave-segura')
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=reader, rol=ProyectoMiembro.Rol.LECTOR
+        )
+        self.client.force_login(reader)
+        response = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+            {'instruction': 'crear clase'}, content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 403)
+        self.client.force_login(self.user)
+        invalid_request = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+            {'instruction': 'crear clase', 'unsafe': 'x'}, content_type='application/json',
+        )
+        self.assertEqual(invalid_request.status_code, 400)
+
+    def test_ai_plan_applies_once_atomically_and_is_idempotent(self):
+        self.diagram.nodes = [self.node('cliente', 'entity')]
+        self.diagram.save()
+        plan = create_plan(
+            user=self.user, diagram=self.diagram,
+            operations=[{'op': 'update_node', 'node_id': 'cliente',
+                         'patch': {'title': 'Persona'}}],
+        )
+        self.diagram.refresh_from_db()
+        self.assertEqual(self.diagram.nodes[0]['data']['title'], 'cliente.java')
+        payload = {'plan_id': str(plan.plan_id), 'idempotency_key': 'rename-cliente-1', 'confirm': False}
+        response = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/', payload,
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['revision'], 1)
+        retry = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/', payload,
+            content_type='application/json',
+        )
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(retry.json(), response.json())
+        self.diagram.refresh_from_db()
+        self.assertEqual(self.diagram.nodes[0]['data']['title'], 'Persona.java')
+        self.assertEqual(self.diagram.revision, 1)
+
+    def test_ai_plan_rejects_confirmation_conflict_expiry_and_invalid_batch(self):
+        self.diagram.nodes = [self.node('cliente', 'entity')]
+        self.diagram.save()
+        delete_plan = create_plan(
+            user=self.user, diagram=self.diagram,
+            operations=[{'op': 'delete_node', 'node_id': 'cliente', 'cascade_incident': True}],
+        )
+        denied_delete = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/',
+            {'plan_id': str(delete_plan.plan_id), 'idempotency_key': 'delete-1', 'confirm': False},
+            content_type='application/json',
+        )
+        self.assertEqual(denied_delete.status_code, 400)
+        self.diagram.refresh_from_db()
+        self.assertEqual(len(self.diagram.nodes), 1)
+
+        conflict_plan = create_plan(
+            user=self.user, diagram=self.diagram,
+            operations=[{'op': 'move_node', 'node_id': 'cliente', 'position': {'x': 20, 'y': 30}}],
+        )
+        self.diagram.revision += 1
+        self.diagram.save(update_fields=['revision'])
+        conflict = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/',
+            {'plan_id': str(conflict_plan.plan_id), 'idempotency_key': 'conflict-1', 'confirm': False},
+            content_type='application/json',
+        )
+        self.assertEqual(conflict.status_code, 400)
+
+        expired_plan = create_plan(
+            user=self.user, diagram=self.diagram,
+            operations=[{'op': 'move_node', 'node_id': 'cliente', 'position': {'x': 40, 'y': 50}}],
+        )
+        expired_plan.expira_en = timezone.now() - timedelta(seconds=1)
+        expired_plan.save(update_fields=['expira_en'])
+        expired = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/',
+            {'plan_id': str(expired_plan.plan_id), 'idempotency_key': 'expired-1', 'confirm': False},
+            content_type='application/json',
+        )
+        self.assertEqual(expired.status_code, 400)
+
+        self.diagram.refresh_from_db()
+        invalid_plan = PlanIA.objects.create(
+            diagrama=self.diagram, usuario=self.user,
+            operaciones=[{'op': 'move_node', 'node_id': 'missing', 'position': {'x': 1, 'y': 2}}],
+            revision_base=self.diagram.revision, request_hash='a' * 64,
+            expira_en=timezone.now() + timedelta(minutes=1),
+        )
+        invalid = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/',
+            {'plan_id': str(invalid_plan.plan_id), 'idempotency_key': 'invalid-1', 'confirm': False},
+            content_type='application/json',
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.diagram.refresh_from_db()
+        self.assertEqual(self.diagram.nodes[0]['position'], {'x': 0, 'y': 0})
+
+    def test_ai_plan_rejects_other_user_and_editor_relation_changes(self):
+        self.diagram.nodes = [self.node('cliente', 'entity'), self.node('pedido', 'entity')]
+        self.diagram.save()
+        editor = get_user_model().objects.create_user(username='editor-ia', password='clave-segura')
+        ProyectoMiembro.objects.create(
+            proyecto=self.project, usuario=editor, rol=ProyectoMiembro.Rol.EDITOR
+        )
+        owner_plan = create_plan(
+            user=self.user, diagram=self.diagram,
+            operations=[{'op': 'move_node', 'node_id': 'cliente', 'position': {'x': 1, 'y': 2}}],
+        )
+        self.client.force_login(editor)
+        other_user = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/',
+            {'plan_id': str(owner_plan.plan_id), 'idempotency_key': 'other-user', 'confirm': False},
+            content_type='application/json',
+        )
+        self.assertEqual(other_user.status_code, 400)
+
+        editor_plan = create_plan(
+            user=editor, diagram=self.diagram,
+            operations=[{
+                'op': 'create_relation', 'source': 'cliente', 'target': 'pedido',
+                'relation_type': 'asociacion',
+                'data': {'multiplicidadOrigen': '1', 'multiplicidadDestino': '*'},
+            }],
+        )
+        relation_denied = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/',
+            {'plan_id': str(editor_plan.plan_id), 'idempotency_key': 'editor-edge', 'confirm': False},
+            content_type='application/json',
+        )
+        self.assertEqual(relation_denied.status_code, 403)
 
     def test_realization_requires_an_interface_target(self):
         nodes = [self.node('pedido', 'entity'), self.node('notificable', 'interface')]
