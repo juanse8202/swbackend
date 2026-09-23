@@ -31,6 +31,7 @@ LEGACY_RELATIONS = {
     'Composicion': 'composicion', 'Herencia': 'herencia',
     'Realizacion': 'realizacion', 'Dependencia': 'dependencia',
 }
+VALID_MULTIPLICITIES = {'1', '0..1', '*', '0..*', '1..*', 'N'}
 
 
 class DiagramGenerationError(Exception):
@@ -80,6 +81,33 @@ def _java_type(value):
     value = re.sub(r'\s*\(@Id\)\s*$', '', value)
     aliases = {'string': 'String', 'integer': 'Integer', 'int': 'Integer', 'uuid': 'UUID', 'long': 'Long', 'decimal': 'BigDecimal', 'boolean': 'Boolean'}
     return aliases.get(value.lower(), value)
+
+
+def _many(value):
+    """True for UML multiplicities that permit more than one instance."""
+    return str(value or '1').strip() in {'N', '*', '0..*', '1..*'}
+
+
+def _relation_annotation(owner_is_source, source_multiplicity, target_multiplicity):
+    """Choose the annotation on the owner field from endpoint multiplicities."""
+    source_many, target_many = _many(source_multiplicity), _many(target_multiplicity)
+    if source_many and target_many:
+        return '@ManyToMany', True
+    if owner_is_source:
+        if target_many:
+            return '@OneToMany', True
+        if source_many:
+            return '@ManyToOne', False
+    else:
+        if source_many:
+            return '@OneToMany', True
+        if target_many:
+            return '@ManyToOne', False
+    return '@OneToOne', False
+
+
+def _edge_error(code, edge_id, message):
+    return {'code': code, 'element_id': edge_id, 'message': message}
 
 
 def _method_signature(raw):
@@ -224,16 +252,64 @@ def normalize_diagram(nodes, edges):
                 continue
             source.interfaces.append(target_id)
         elif relation_type in {'asociacion', 'agregacion', 'composicion'}:
-            annotation = data.get('jpaAnnotation')
-            if annotation in {'@OneToOne', '@OneToMany', '@ManyToOne', '@ManyToMany'}:
-                if not source.persistent or not target.persistent:
-                    errors.append({
-                        'code': 'invalid_jpa_relationship',
-                        'element_id': edge_id,
-                        'message': 'Una relación JPA solo puede unir dos entidades persistentes.',
-                    })
+            if not source.persistent or not target.persistent:
+                errors.append(_edge_error('invalid_jpa_relationship', edge_id, 'Una relación JPA solo puede unir dos entidades persistentes.'))
+                continue
+            source_multiplicity = data.get('multiplicidadOrigen') or '1'
+            target_multiplicity = data.get('multiplicidadDestino') or 'N'
+            if source_multiplicity not in VALID_MULTIPLICITIES or target_multiplicity not in VALID_MULTIPLICITIES:
+                errors.append(_edge_error('invalid_multiplicity', edge_id, 'Las multiplicidades deben ser 1, 0..1, *, 0..* o 1..*.'))
+                continue
+            owner_id = data.get('ownerNodeId')
+            # Old diagrams were unidirectional and did not store ownership.
+            if not owner_id:
+                owner_id = (data.get('wholeNodeId') or target_id) if relation_type in {'agregacion', 'composicion'} else source_id
+            if owner_id not in {source_id, target_id}:
+                errors.append(_edge_error('invalid_relationship_owner', edge_id, 'ownerNodeId debe apuntar a uno de los extremos.'))
+                continue
+            whole_id = data.get('wholeNodeId')
+            if relation_type in {'agregacion', 'composicion'}:
+                whole_id = whole_id or (target_id if data.get('relationConvention') == 'target-whole-v1' else None)
+                if whole_id not in {source_id, target_id}:
+                    errors.append(_edge_error('missing_whole', edge_id, 'La agregación o composición requiere wholeNodeId.'))
                     continue
-                source.relations.append({'target': target_id, 'annotation': annotation, 'name': data.get('roleName') or target.name[:1].lower() + target.name[1:]})
+                if relation_type == 'composicion' and owner_id != whole_id:
+                    errors.append(_edge_error('composition_owner_required', edge_id, 'El whole debe ser el propietario de una composición.'))
+                    continue
+            owner, other = (source, target) if owner_id == source_id else (target, source)
+            owner_is_source = owner_id == source_id
+            annotation, collection = _relation_annotation(owner_is_source, source_multiplicity, target_multiplicity)
+            if relation_type == 'composicion' and annotation not in {'@OneToOne', '@OneToMany'}:
+                errors.append(_edge_error('invalid_composition_cardinality', edge_id, 'Una composición debe tener al whole como OneToOne o OneToMany.'))
+                continue
+            if bool(data.get('bidirectional', False)) and annotation == '@OneToMany':
+                errors.append(_edge_error('invalid_bidirectional_owner', edge_id, 'En una relación bidireccional OneToMany, el propietario debe ser el extremo ManyToOne.'))
+                continue
+            owner_role = data.get('sourceRole' if owner_is_source else 'targetRole') or other.name[:1].lower() + other.name[1:]
+            inverse_role = data.get('targetRole' if owner_is_source else 'sourceRole') or owner.name[:1].lower() + owner.name[1:]
+            try:
+                owner_role = _java_name(owner_role, element_id=edge_id, label='El rol propietario')
+                inverse_role = _java_name(inverse_role, element_id=edge_id, label='El rol inverso')
+            except DiagramGenerationError as error:
+                errors.extend(error.errors)
+                continue
+            owner.relations.append({
+                'target': other.identifier, 'annotation': annotation, 'name': owner_role,
+                'collection': collection, 'owner': True,
+                'cascade': relation_type == 'composicion',
+                'join_column': f'{owner_role}_id',
+                'join_table': f'{owner.name.lower()}_{other.name.lower()}',
+            })
+            if bool(data.get('bidirectional', False)):
+                inverse_annotation = {
+                    '@OneToMany': '@ManyToOne',
+                    '@ManyToOne': '@OneToMany',
+                }.get(annotation, annotation)
+                other.relations.append({
+                    'target': owner.identifier, 'annotation': inverse_annotation, 'name': inverse_role,
+                    'collection': inverse_annotation in {'@OneToMany', '@ManyToMany'}, 'owner': False,
+                    'mapped_by': owner_role, 'cascade': False,
+                })
 
     for node_id in inheritance:
         visited, cursor = set(), node_id
@@ -243,6 +319,14 @@ def normalize_diagram(nodes, edges):
                 break
             visited.add(cursor)
             cursor = inheritance[cursor]
+    if errors:
+        raise DiagramGenerationError(errors)
+    for node in result.values():
+        used_names = {attribute['name'] for attribute in node.attributes}
+        for relation in node.relations:
+            if relation['name'] in used_names:
+                errors.append(_edge_error('duplicate_relationship_field', node.identifier, f"El campo {relation['name']!r} está duplicado."))
+            used_names.add(relation['name'])
     if errors:
         raise DiagramGenerationError(errors)
     for node in result.values():
@@ -283,8 +367,10 @@ public class Application {
 {% endif %}{% endif %}{% if attribute.embedded %}    @Embedded
 {% endif %}    private {{ attribute.type }} {{ attribute.name }};
 {% endfor %}{% for relation in node.relations %}
-    {{ relation.annotation }}
-    private {% if relation.annotation == '@OneToMany' or relation.annotation == '@ManyToMany' %}List<{{ relation.target_name }}>{% else %}{{ relation.target_name }}{% endif %} {{ relation.name }};
+    {{ relation.annotation }}{% if relation.cascade %}(cascade = CascadeType.ALL, orphanRemoval = true){% elif not relation.owner and relation.annotation in ['@OneToMany', '@OneToOne', '@ManyToMany'] %}(mappedBy = "{{ relation.mapped_by }}"){% endif %}{% if relation.owner and relation.annotation == '@ManyToMany' %}
+    @JoinTable(name = "{{ relation.join_table }}"){% elif relation.owner and relation.annotation != '@OneToMany' %}
+    @JoinColumn(name = "{{ relation.join_column }}"){% endif %}
+    private {% if relation.collection %}List<{{ relation.target_name }}>{% else %}{{ relation.target_name }}{% endif %} {{ relation.name }};
 {% endfor %}
     public {{ node.name }}() {
     }
@@ -582,7 +668,7 @@ def _render_project(nodes, package, artifact, directory):
             'uses_uuid': any(item['type'] == 'UUID' for item in node.attributes),
             'uses_bigdecimal': any(item['type'] == 'BigDecimal' for item in node.attributes),
             'uses_list': any(
-                item['annotation'] in {'@OneToMany', '@ManyToMany'}
+                item.get('collection')
                 for item in node.relations
             ),
         }

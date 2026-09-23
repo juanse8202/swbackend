@@ -237,6 +237,87 @@ class DiagramUmlContractTests(TestCase):
         self.assertNotIn('tipos/src/main/java/com/example/tipos/controller/EstadoController.java', names)
         self.assertNotIn('tipos/src/main/java/com/example/tipos/controller/DireccionController.java', names)
 
+    def test_generator_maps_jpa_multiplicity_ownership_and_composition(self):
+        pedido = self.node('pedido', 'entity')
+        pedido['data']['title'] = 'Pedido.java'
+        linea = self.node('linea', 'entity')
+        linea['data']['title'] = 'Linea.java'
+        etiqueta = self.node('etiqueta', 'entity')
+        etiqueta['data']['title'] = 'Etiqueta.java'
+        edges = [
+            {
+                **self.edge('pedido-lineas', 'pedido', 'linea', 'composicion'),
+                'data': {
+                    'relationType': 'composicion', 'multiplicidadOrigen': '1',
+                    'multiplicidadDestino': 'N', 'ownerNodeId': 'pedido',
+                    'wholeNodeId': 'pedido', 'sourceRole': 'lineas',
+                    'targetRole': 'pedido', 'bidirectional': False,
+                },
+            },
+            {
+                **self.edge('pedido-etiquetas', 'pedido', 'etiqueta', 'asociacion'),
+                'data': {
+                    'relationType': 'asociacion', 'multiplicidadOrigen': 'N',
+                    'multiplicidadDestino': 'N', 'ownerNodeId': 'pedido',
+                    'sourceRole': 'etiquetas', 'targetRole': 'pedidos',
+                    'bidirectional': True,
+                },
+            },
+        ]
+        payload, _ = generate_spring_boot_zip(
+            [pedido, linea, etiqueta], edges, artifact='relaciones', package='com.example.relaciones'
+        )
+        with ZipFile(BytesIO(payload)) as archive:
+            pedido_source = archive.read('relaciones/src/main/java/com/example/relaciones/entity/Pedido.java').decode()
+            etiqueta_source = archive.read('relaciones/src/main/java/com/example/relaciones/entity/Etiqueta.java').decode()
+        self.assertIn('@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true)', pedido_source)
+        self.assertIn('List<Linea> lineas', pedido_source)
+        self.assertIn('@ManyToMany', pedido_source)
+        self.assertIn('@JoinTable(name = "pedido_etiqueta")', pedido_source)
+        self.assertIn('@ManyToMany(mappedBy = "etiquetas")', etiqueta_source)
+
+    def test_generator_maps_one_to_one_and_aggregation_without_cascade(self):
+        usuario = self.node('usuario', 'entity')
+        perfil = self.node('perfil', 'entity')
+        catalogo = self.node('catalogo', 'entity')
+        producto = self.node('producto', 'entity')
+        for node in (usuario, perfil, catalogo, producto):
+            node['data']['title'] = f"{node['id'].title()}.java"
+        edges = [
+            {
+                **self.edge('usuario-perfil', 'usuario', 'perfil', 'asociacion'),
+                'data': {
+                    'relationType': 'asociacion', 'multiplicidadOrigen': '1',
+                    'multiplicidadDestino': '1', 'ownerNodeId': 'usuario',
+                    'sourceRole': 'perfil', 'targetRole': 'usuario', 'bidirectional': True,
+                },
+            },
+            {
+                **self.edge('catalogo-productos', 'catalogo', 'producto', 'agregacion'),
+                'data': {
+                    'relationType': 'agregacion', 'multiplicidadOrigen': '1',
+                    'multiplicidadDestino': '*', 'ownerNodeId': 'catalogo',
+                    'wholeNodeId': 'catalogo', 'sourceRole': 'productos',
+                    'targetRole': 'catalogo', 'bidirectional': False,
+                },
+            },
+        ]
+        payload, _ = generate_spring_boot_zip(
+            [usuario, perfil, catalogo, producto], edges,
+            artifact='semantica', package='com.example.semantica',
+        )
+        with ZipFile(BytesIO(payload)) as archive:
+            usuario_source = archive.read('semantica/src/main/java/com/example/semantica/entity/Usuario.java').decode()
+            perfil_source = archive.read('semantica/src/main/java/com/example/semantica/entity/Perfil.java').decode()
+            catalogo_source = archive.read('semantica/src/main/java/com/example/semantica/entity/Catalogo.java').decode()
+        self.assertIn('@OneToOne', usuario_source)
+        self.assertIn('@JoinColumn(name = "perfil_id")', usuario_source)
+        self.assertIn('@OneToOne(mappedBy = "perfil")', perfil_source)
+        self.assertIn('@OneToMany', catalogo_source)
+        self.assertIn('List<Producto> productos', catalogo_source)
+        self.assertNotIn('CascadeType.REMOVE', catalogo_source)
+        self.assertNotIn('orphanRemoval = true', catalogo_source)
+
     def test_serializer_validates_enum_and_embedded_contract(self):
         entity = self.node('pedido', 'entity')
         entity['data'].update({

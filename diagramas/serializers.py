@@ -51,7 +51,8 @@ class DiagramaSerializer(serializers.ModelSerializer):
         'manyToOne': 'asociacion',
         'manyToMany': 'asociacion',
     }
-    MULTIPLICITY_PATTERN = re.compile(r'^(?:N|\*|\d+(?:\.\.(?:\d+|\*))?)$')
+    MULTIPLICITY_PATTERN = re.compile(r'^(?:N|\*|1|0\.\.1|0\.\.\*|1\.\.\*)$')
+    JAVA_MEMBER_PATTERN = re.compile(r'^[A-Za-z_$][A-Za-z0-9_$]*$')
 
     class Meta:
         model = Diagrama
@@ -75,13 +76,18 @@ class DiagramaSerializer(serializers.ModelSerializer):
         return relation_type
 
     @classmethod
-    def _validate_multiplicity(cls, value, field_name):
+    def _validate_multiplicity(cls, value, field_name, edge_id):
         if value in (None, ''):
             return
         if not isinstance(value, str) or not cls.MULTIPLICITY_PATTERN.fullmatch(value.strip()):
-            raise serializers.ValidationError(
-                {field_name: 'Usa valores como 1, 0..1, 0..* o N.'}
-            )
+            raise cls._edge_error(edge_id, f'{field_name} debe ser 1, 0..1, *, 0..* o 1..*.')
+
+    @classmethod
+    def _edge_error(cls, edge_id, message):
+        return serializers.ValidationError({
+            'element_id': edge_id,
+            'message': message,
+        })
 
     def validate(self, attrs):
         instance = getattr(self, 'instance', None)
@@ -169,6 +175,7 @@ class DiagramaSerializer(serializers.ModelSerializer):
                         })
 
         inheritance_parents = {}
+        composite_owners = {}
         for index, edge in enumerate(edges):
             if not isinstance(edge, dict):
                 raise serializers.ValidationError({'edges': {index: 'Cada relación debe ser un objeto.'}})
@@ -186,20 +193,53 @@ class DiagramaSerializer(serializers.ModelSerializer):
             try:
                 relation_type = self._relation_type(edge)
                 data = edge.get('data') or {}
-                self._validate_multiplicity(data.get('multiplicidadOrigen'), 'multiplicidadOrigen')
-                self._validate_multiplicity(data.get('multiplicidadDestino'), 'multiplicidadDestino')
+                self._validate_multiplicity(data.get('multiplicidadOrigen'), 'multiplicidadOrigen', edge_id)
+                self._validate_multiplicity(data.get('multiplicidadDestino'), 'multiplicidadDestino', edge_id)
             except serializers.ValidationError as error:
                 raise serializers.ValidationError({'edges': {index: error.detail}}) from error
 
             source_kind = node_kinds[source]
             target_kind = node_kinds[target]
             annotation = data.get('jpaAnnotation')
-            if annotation in {'@OneToOne', '@OneToMany', '@ManyToOne', '@ManyToMany'} and (
-                source_kind != 'entity' or target_kind != 'entity'
-            ):
-                raise serializers.ValidationError({
-                    'edges': {index: {'data': {'jpaAnnotation': 'Las relaciones JPA solo pueden unir entidades.'}}}
-                })
+            if relation_type in {'asociacion', 'agregacion', 'composicion'}:
+                if source_kind != 'entity' or target_kind != 'entity':
+                    raise serializers.ValidationError({'edges': {index: self._edge_error(
+                        edge_id, 'Las relaciones JPA solo pueden unir entidades.'
+                    ).detail}})
+                owner_id = data.get('ownerNodeId')
+                if owner_id not in (None, '', source, target):
+                    raise serializers.ValidationError({'edges': {index: self._edge_error(
+                        edge_id, 'ownerNodeId debe ser el nodo origen o el nodo destino.'
+                    ).detail}})
+                if 'bidirectional' in data and not isinstance(data['bidirectional'], bool):
+                    raise serializers.ValidationError({'edges': {index: self._edge_error(
+                        edge_id, 'bidirectional debe ser verdadero o falso.'
+                    ).detail}})
+                for role_field in ('sourceRole', 'targetRole'):
+                    role = data.get(role_field)
+                    if role not in (None, '') and (
+                        not isinstance(role, str) or not self.JAVA_MEMBER_PATTERN.fullmatch(role.strip())
+                    ):
+                        raise serializers.ValidationError({'edges': {index: self._edge_error(
+                            edge_id, f'{role_field} debe ser un identificador Java válido.'
+                        ).detail}})
+                if relation_type in {'agregacion', 'composicion'}:
+                    whole_id = data.get('wholeNodeId') or (target if data.get('relationConvention') == 'target-whole-v1' else None)
+                    if whole_id not in {source, target}:
+                        raise serializers.ValidationError({'edges': {index: self._edge_error(
+                            edge_id, 'La agregación o composición requiere wholeNodeId.'
+                        ).detail}})
+                    if relation_type == 'composicion':
+                        if owner_id and owner_id != whole_id:
+                            raise serializers.ValidationError({'edges': {index: self._edge_error(
+                                edge_id, 'En una composición, ownerNodeId debe ser igual a wholeNodeId.'
+                            ).detail}})
+                        part_id = target if whole_id == source else source
+                        if part_id in composite_owners and composite_owners[part_id] != whole_id:
+                            raise serializers.ValidationError({'edges': {index: self._edge_error(
+                                edge_id, 'Una parte no puede pertenecer a más de una composición.'
+                            ).detail}})
+                        composite_owners[part_id] = whole_id
             if relation_type == 'realizacion':
                 if source_kind not in self.CLASS_KINDS:
                     raise serializers.ValidationError({
