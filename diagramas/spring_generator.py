@@ -253,6 +253,11 @@ def normalize_diagram(nodes, edges):
             source.interfaces.append(target_id)
         elif relation_type in {'asociacion', 'agregacion', 'composicion'}:
             if not source.persistent or not target.persistent:
+                if data.get('jpaManaged') is False:
+                    # A relationship imported from XMI between ordinary UML
+                    # classes is model metadata, not a JPA mapping.  Keep it
+                    # in Diagrama.edges but do not invent persistence fields.
+                    continue
                 errors.append(_edge_error('invalid_jpa_relationship', edge_id, 'Una relación JPA solo puede unir dos entidades persistentes.'))
                 continue
             source_multiplicity = data.get('multiplicidadOrigen') or '1'

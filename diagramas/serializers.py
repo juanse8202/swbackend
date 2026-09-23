@@ -202,10 +202,23 @@ class DiagramaSerializer(serializers.ModelSerializer):
             target_kind = node_kinds[target]
             annotation = data.get('jpaAnnotation')
             if relation_type in {'asociacion', 'agregacion', 'composicion'}:
-                if source_kind != 'entity' or target_kind != 'entity':
+                # XMI can describe a pure UML association between ordinary
+                # classes.  It is kept in the diagram, but must never be
+                # treated as a JPA relation by the Spring generator.
+                jpa_managed = data.get('jpaManaged', True)
+                if not isinstance(jpa_managed, bool):
+                    raise serializers.ValidationError({'edges': {index: self._edge_error(
+                        edge_id, 'jpaManaged debe ser verdadero o falso.'
+                    ).detail}})
+                if (source_kind != 'entity' or target_kind != 'entity') and jpa_managed:
                     raise serializers.ValidationError({'edges': {index: self._edge_error(
                         edge_id, 'Las relaciones JPA solo pueden unir entidades.'
                     ).detail}})
+                if not jpa_managed:
+                    # Association/aggregation/composition UML no persistente:
+                    # preserve its endpoint semantics and multiplicities as
+                    # imported, without applying Java/JPA-only constraints.
+                    continue
                 owner_id = data.get('ownerNodeId')
                 if owner_id not in (None, '', source, target):
                     raise serializers.ValidationError({'edges': {index: self._edge_error(

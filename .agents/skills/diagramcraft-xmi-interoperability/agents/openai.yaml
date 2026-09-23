@@ -1,0 +1,15 @@
+interface:
+  display_name: DiagramCraft XMI Interoperability
+  short_description: Importa y exporta XMI entre DiagramCraft y EA.
+  default_prompt: Implementa o mejora la interoperabilidad XMI de DiagramCraft con
+    Enterprise Architect en React y Django, preservando clases, interfaces y relaciones
+    UML.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

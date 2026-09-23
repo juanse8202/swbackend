@@ -11,6 +11,7 @@ from .serializers import (
     RelacionUMLSerializer, VersionDiagramaSerializer,
 )
 from .spring_generator import DiagramGenerationError, generate_spring_boot_zip
+from .xmi import XmiError, export_xmi, parse_xmi
 
 
 class DiagramAccessMixin:
@@ -104,6 +105,51 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
             raise ValidationError({'errors': error.errors}) from error
         response = HttpResponse(archive, content_type='application/zip')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
+    @action(detail=True, methods=['post'], url_path='importar-xmi')
+    def importar_xmi(self, request, pk=None):
+        diagram = self.get_object()
+        self.require_diagram_role(
+            diagram, {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+            'Solo el propietario o arquitecto puede importar XMI.',
+        )
+        upload = request.FILES.get('file')
+        if upload is None:
+            raise ValidationError({'file': 'Selecciona un archivo XMI.'})
+        if not str(upload.name).lower().endswith(('.xmi', '.xml')):
+            raise ValidationError({'file': 'El archivo debe terminar en .xmi o .xml.'})
+        if request.data.get('mode', 'replace') != 'replace':
+            raise ValidationError({'mode': 'Por ahora solo se admite el modo replace.'})
+        try:
+            imported = parse_xmi(upload.read())
+        except XmiError as error:
+            raise ValidationError({'errors': [error.error]}) from error
+        # Validate the complete candidate before changing the persisted canvas.
+        serializer = self.get_serializer(
+            diagram, data={'nodes': imported['nodes'], 'edges': imported['edges']}, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return HttpResponse(
+            __import__('json').dumps({
+                'nodes': serializer.instance.nodes, 'edges': serializer.instance.edges,
+                'report': imported['report'],
+            }), content_type='application/json', status=200,
+        )
+
+    @action(detail=True, methods=['get'], url_path='exportar-xmi')
+    def exportar_xmi(self, request, pk=None):
+        diagram = self.get_object()
+        self.require_diagram_role(
+            diagram, {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+            'Solo el propietario o arquitecto puede exportar XMI.',
+        )
+        serializer = self.get_serializer(diagram, data={'nodes': diagram.nodes, 'edges': diagram.edges}, partial=True)
+        serializer.is_valid(raise_exception=True)
+        xml = export_xmi(diagram.nodes, diagram.edges)
+        response = HttpResponse(xml, content_type='application/xml; charset=utf-8')
+        response['Content-Disposition'] = f'attachment; filename="diagrama-{diagram.id}.xmi"'
         return response
 
 
