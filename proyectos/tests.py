@@ -376,7 +376,10 @@ class CollaborativeProjectTests(TestCase):
             proyecto=self.project, usuario=self.first_user, rol=ProyectoMiembro.Rol.ARQUITECTO
         )
         self.client.force_login(self.first_user)
-        nodes = [{'id': 'usuario', 'type': 'uml', 'position': {'x': 120, 'y': 80}, 'data': {'nombre': 'Usuario'}}]
+        nodes = [
+            {'id': 'usuario', 'type': 'uml', 'position': {'x': 120, 'y': 80}, 'data': {'nombre': 'Usuario'}},
+            {'id': 'proyecto', 'type': 'uml', 'position': {'x': 360, 'y': 80}, 'data': {'nombre': 'Proyecto'}},
+        ]
         edges = [{'id': 'usuario-proyecto', 'source': 'usuario', 'target': 'proyecto'}]
 
         update_response = self.client.patch(

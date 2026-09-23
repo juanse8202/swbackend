@@ -1,4 +1,7 @@
+from django.http import HttpResponse
 from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 
 from proyectos.models import ProyectoMiembro
 from proyectos.permissions import EDIT_ROLES, require_role, role_for
@@ -7,6 +10,7 @@ from .serializers import (
     AtributoUMLSerializer, ClaseUMLSerializer, DiagramaSerializer,
     RelacionUMLSerializer, VersionDiagramaSerializer,
 )
+from .spring_generator import DiagramGenerationError, generate_spring_boot_zip
 
 
 class DiagramAccessMixin:
@@ -78,6 +82,29 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
             {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
         )
         instance.delete()
+
+    @action(detail=True, methods=['post'], url_path='generar-spring-boot')
+    def generar_spring_boot(self, request, pk=None):
+        """Genera un artefacto descargable, sin ejecutar código de usuario."""
+        diagram = self.get_object()
+        self.require_diagram_role(
+            diagram,
+            {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
+            'Solo el propietario o arquitecto puede generar Spring Boot.',
+        )
+        options = request.data if isinstance(request.data, dict) else {}
+        try:
+            archive, filename = generate_spring_boot_zip(
+                diagram.nodes,
+                diagram.edges,
+                artifact=options.get('artifact', diagram.nombre),
+                package=options.get('package', 'com.diagramcraft.generated'),
+            )
+        except DiagramGenerationError as error:
+            raise ValidationError({'errors': error.errors}) from error
+        response = HttpResponse(archive, content_type='application/zip')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
 
 
 class ClaseUMLViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
