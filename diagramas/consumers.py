@@ -10,6 +10,23 @@ from .serializers import DiagramaSerializer
 from proyectos.models import ProyectoMiembro
 
 
+def first_validation_message(value):
+    """Return a short, JSON-safe message from nested DRF validation errors."""
+    if isinstance(value, dict):
+        for child in value.values():
+            message = first_validation_message(child)
+            if message:
+                return message
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            message = first_validation_message(child)
+            if message:
+                return message
+    elif value:
+        return str(value)
+    return None
+
+
 @database_sync_to_async
 def project_for_authorized_diagram(user_id, diagram_id):
     return Diagrama.objects.filter(
@@ -24,29 +41,32 @@ def save_diagram_if_user_can_access(user_id, diagram_id, nodes, edges):
     with transaction.atomic():
         diagram = Diagrama.objects.select_for_update().filter(pk=diagram_id).first()
         if diagram is None:
-            return None
+            return {'status': 'forbidden'}
         try:
             membership = diagram.proyecto.miembros.get(usuario_id=user_id)
         except ProyectoMiembro.DoesNotExist:
-            return None
+            return {'status': 'forbidden'}
         if membership.rol not in {
             ProyectoMiembro.Rol.PROPIETARIO,
             ProyectoMiembro.Rol.ARQUITECTO,
             ProyectoMiembro.Rol.EDITOR,
         }:
-            return None
+            return {'status': 'forbidden'}
         if membership.rol == ProyectoMiembro.Rol.EDITOR and diagram.edges != edges:
-            return None
+            return {'status': 'forbidden'}
         serializer = DiagramaSerializer(diagram, data={'nodes': nodes, 'edges': edges}, partial=True)
         if not serializer.is_valid():
-            return None
+            return {
+                'status': 'invalid',
+                'detail': first_validation_message(serializer.errors) or 'El diagrama contiene datos invÃ¡lidos.',
+            }
         if diagram.nodes == nodes and diagram.edges == edges:
-            return diagram.revision
+            return {'status': 'saved', 'revision': diagram.revision}
         diagram.nodes = nodes
         diagram.edges = edges
         diagram.revision += 1
         diagram.save(update_fields=['nodes', 'edges', 'revision', 'fecha_modificacion'])
-        return diagram.revision
+        return {'status': 'saved', 'revision': diagram.revision}
 
 
 @database_sync_to_async
@@ -201,16 +221,24 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
 
         # El permiso se comprueba tambien en cada escritura, por si el
         # colaborador fue retirado despues de abrir el WebSocket.
-        revision = await save_diagram_if_user_can_access(
+        result = await save_diagram_if_user_can_access(
             self.scope['user'].id, self.diagrama_id, nodes, edges
         )
-        if revision is None:
+        if result['status'] == 'forbidden':
             await self.send_json({
                 'type': 'diagram.error',
                 'detail': 'No tienes permiso para editar este diagrama.',
             })
             await self.close(code=4403)
             return
+        if result['status'] == 'invalid':
+            await self.send_json({
+                'type': 'diagram.error',
+                'detail': result['detail'],
+            })
+            return
+
+        revision = result['revision']
 
         await touch_presence(self.channel_name)
 

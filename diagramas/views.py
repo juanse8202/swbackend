@@ -1,3 +1,5 @@
+import json
+
 from django.db import transaction
 from django.http import HttpResponse
 from rest_framework import viewsets
@@ -166,16 +168,19 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         )
         options = request.data if isinstance(request.data, dict) else {}
         try:
-            archive, filename = generate_spring_boot_zip(
+            archive, filename, warnings = generate_spring_boot_zip(
                 diagram.nodes,
                 diagram.edges,
                 artifact=options.get('artifact', diagram.nombre),
                 package=options.get('package', 'com.diagramcraft.generated'),
+                return_warnings=True,
             )
         except DiagramGenerationError as error:
             raise ValidationError({'errors': error.errors}) from error
         response = HttpResponse(archive, content_type='application/zip')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        if warnings:
+            response['X-DiagramCraft-Warnings'] = json.dumps(warnings, ensure_ascii=False)
         return response
 
     @action(detail=True, methods=['post'], url_path='importar-xmi')
@@ -221,7 +226,7 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         )
         serializer = self.get_serializer(diagram, data={'nodes': diagram.nodes, 'edges': diagram.edges}, partial=True)
         serializer.is_valid(raise_exception=True)
-        xml = export_xmi(diagram.nodes, diagram.edges)
+        xml = export_xmi(diagram.nodes, diagram.edges, diagram_name=diagram.nombre)
         response = HttpResponse(xml, content_type='application/xml; charset=utf-8')
         response['Content-Disposition'] = f'attachment; filename="diagrama-{diagram.id}.xmi"'
         return response

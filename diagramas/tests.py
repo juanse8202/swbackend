@@ -15,7 +15,8 @@ from .models import Diagrama, PlanIA
 from .ai_operations import OperationError, execute_operations
 from .ai_interpreter import AiProviderError
 from .ai_plans import create_plan
-from .spring_generator import generate_spring_boot_zip
+from .spring_generator import DiagramGenerationError, generate_spring_boot_zip
+from .foreign_keys import normalize_legacy_foreign_keys
 from .xmi import UMLDI, XMI, XmiError, export_xmi, parse_xmi
 
 
@@ -68,6 +69,157 @@ class DiagramUmlContractTests(TestCase):
             {'nodes': nodes, 'edges': edges},
             content_type='application/json',
         )
+
+    def test_uml_association_between_classes_is_compatible_without_jpa_flag(self):
+        """Old and EA-style UML associations must not be reinterpreted as JPA."""
+        nodes = [self.node('cliente', 'class'), self.node('pedido', 'class')]
+        edge = self.edge('cliente-pedido', 'cliente', 'pedido', 'asociacion')
+        response = self.patch_document(nodes, [edge])
+        self.assertEqual(response.status_code, 200, response.content)
+        self.diagram.refresh_from_db()
+        self.assertEqual(self.diagram.edges, [edge])
+
+        archive, _filename = generate_spring_boot_zip(nodes, [edge])
+        with ZipFile(BytesIO(archive)) as generated:
+            names = set(generated.namelist())
+        self.assertIn('diagramcraft-generated/src/main/java/com/diagramcraft/generated/model/Cliente.java', names)
+        self.assertIn('diagramcraft-generated/src/main/java/com/diagramcraft/generated/model/Pedido.java', names)
+        self.assertNotIn('diagramcraft-generated/src/main/java/com/diagramcraft/generated/repository/ClienteRepository.java', names)
+
+    def test_jpa_flag_requires_entities_but_uml_flag_is_valid(self):
+        nodes = [self.node('cliente', 'class'), self.node('pedido', 'entity')]
+        edge = self.edge('cliente-pedido', 'cliente', 'pedido', 'asociacion')
+        edge['data']['jpaManaged'] = False
+        self.assertEqual(self.patch_document(nodes, [edge]).status_code, 200)
+
+        edge['data']['jpaManaged'] = True
+        response = self.patch_document(nodes, [edge])
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('solo pueden unir entidades', str(response.json()))
+        with self.assertRaises(DiagramGenerationError) as caught:
+            generate_spring_boot_zip(nodes, [edge])
+        self.assertEqual(caught.exception.errors[0]['code'], 'invalid_jpa_relationship')
+
+    def test_explicit_uml_flag_skips_jpa_mapping_between_entities(self):
+        nodes = [self.node('cliente', 'entity'), self.node('pedido', 'entity')]
+        edge = self.edge('cliente-pedido', 'cliente', 'pedido', 'asociacion')
+        edge['data']['jpaManaged'] = False
+        self.assertEqual(self.patch_document(nodes, [edge]).status_code, 200)
+        archive, _filename = generate_spring_boot_zip(nodes, [edge])
+        with ZipFile(BytesIO(archive)) as generated:
+            source = generated.read(
+                'diagramcraft-generated/src/main/java/com/diagramcraft/generated/entity/Cliente.java'
+            ).decode()
+        self.assertIn('@Entity', source)
+        self.assertNotIn('@OneToOne', source)
+        self.assertNotIn('private Pedido', source)
+
+    def test_invalid_jpa_flag_is_rejected_by_save_and_generation(self):
+        nodes = [self.node('cliente', 'class'), self.node('pedido', 'class')]
+        for value in ('false', 0, 1, [], {}):
+            with self.subTest(value=value):
+                edge = self.edge('cliente-pedido', 'cliente', 'pedido', 'asociacion')
+                edge['data']['jpaManaged'] = value
+                response = self.patch_document(nodes, [edge])
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('jpaManaged', str(response.json()))
+                with self.assertRaises(DiagramGenerationError) as caught:
+                    generate_spring_boot_zip(nodes, [edge])
+                self.assertEqual(caught.exception.errors[0]['code'], 'invalid_jpa_managed')
+
+    def test_legacy_sql_fk_is_normalized_to_a_managed_relationship(self):
+        user = self.node('auth-user', 'entity')
+        user['data']['title'] = 'auth_user.java'
+        audit = self.node('audit', 'entity')
+        audit['data']['properties'].append({
+            'name': 'created_by(FK: auth_user)', 'type': 'String',
+        })
+        nodes, edges, warnings = normalize_legacy_foreign_keys([audit, user], [])
+        property_ = nodes[0]['data']['properties'][1]
+        self.assertEqual(property_['name'], 'created_by')
+        self.assertEqual(property_['sourceLabel'], 'created_by(FK: auth_user)')
+        self.assertEqual(property_['foreignTable'], 'auth_user')
+        self.assertEqual(property_['foreignKeyMode'], 'relation')
+        self.assertFalse(warnings)
+        self.assertEqual(len(edges), 1)
+        self.assertTrue(edges[0]['data']['jpaManaged'])
+
+        archive, _filename = generate_spring_boot_zip([audit, user], [])
+        with ZipFile(BytesIO(archive)) as generated:
+            source = generated.read(
+                'diagramcraft-generated/src/main/java/com/diagramcraft/generated/entity/Audit.java'
+            ).decode()
+        self.assertIn('@ManyToOne', source)
+        self.assertIn('private Auth_user created_by;', source)
+        self.assertNotIn('private String created_by;', source)
+
+    def test_legacy_sql_fk_with_semicolon_from_xmi_is_normalized(self):
+        user = self.node('auth-user', 'class')
+        user['data']['title'] = 'auth_user.java'
+        audit = self.node('audit', 'class')
+        audit['data']['properties'].append({
+            'name': 'created_by(FK; auth_user)}', 'type': 'String',
+        })
+
+        nodes, edges, warnings = normalize_legacy_foreign_keys([audit, user], [])
+
+        property_ = nodes[0]['data']['properties'][0]
+        self.assertEqual(property_['name'], 'created_by')
+        self.assertEqual(property_['sourceLabel'], 'created_by(FK; auth_user)}')
+        self.assertFalse(edges[0]['data']['jpaManaged'])
+        self.assertFalse(warnings)
+
+    def test_legacy_fk_to_class_is_uml_and_unresolved_fk_is_a_warning(self):
+        provider = self.node('proveedor', 'class')
+        invoice = self.node('factura', 'entity')
+        invoice['data']['properties'].append({'name': 'proveedor(FK: proveedor)', 'type': 'String'})
+        nodes, edges, warnings = normalize_legacy_foreign_keys([invoice, provider], [])
+        self.assertFalse(edges[0]['data']['jpaManaged'])
+        self.assertFalse(warnings)
+        archive, _filename = generate_spring_boot_zip(nodes, edges)
+        self.assertTrue(archive)
+
+        orphan = self.node('orden', 'entity')
+        orphan['data']['properties'].append({'name': 'sucursal(FK: sucursal)', 'type': 'String'})
+        archive, _filename, warnings = generate_spring_boot_zip([orphan], [], return_warnings=True)
+        self.assertTrue(archive)
+        self.assertEqual(warnings[0]['code'], 'unresolved_legacy_foreign_key')
+
+    def test_legacy_fk_collision_is_disambiguated_and_generated_java_compiles(self):
+        user = self.node('usuario', 'class')
+        user['data']['title'] = 'usuario.java'
+        sale = self.node('venta', 'class')
+        sale['data']['properties'] = [
+            {'name': 'deleted_at', 'type': 'Integer'},
+            {'name': 'deleted_at(FK; usuario)', 'type': 'Integer'},
+        ]
+        nodes, edges, warnings = normalize_legacy_foreign_keys([sale, user], [])
+        self.assertEqual([item['name'] for item in nodes[0]['data']['properties']], ['deleted_at', 'deleted_at_id'])
+        self.assertEqual(edges[0]['data']['sourceRole'], 'deleted_at_id')
+        self.assertEqual(warnings[0]['code'], 'legacy_foreign_key_name_disambiguated')
+        archive, _filename = generate_spring_boot_zip(nodes, edges)
+        with ZipFile(BytesIO(archive)) as generated:
+            source = generated.read('diagramcraft-generated/src/main/java/com/diagramcraft/generated/model/Venta.java').decode()
+        self.assertIn('private Integer deleted_at;', source)
+        self.assertIn('private Integer deleted_at_id;', source)
+
+    def test_previously_saved_legacy_fk_collision_is_disambiguated_at_generation(self):
+        sale = self.node('venta', 'class')
+        sale['data']['properties'] = [
+            {'name': 'deleted_at', 'type': 'Integer'},
+            {'name': 'deleted_at', 'type': 'Integer', 'sourceLabel': 'deleted_at(FK; auth_user)', 'foreignKeyMode': 'scalar'},
+        ]
+        archive, _filename = generate_spring_boot_zip([sale], [])
+        with ZipFile(BytesIO(archive)) as generated:
+            source = generated.read('diagramcraft-generated/src/main/java/com/diagramcraft/generated/model/Venta.java').decode()
+        self.assertIn('private Integer deleted_at_id;', source)
+
+    def test_manual_invalid_property_is_not_silently_normalized(self):
+        node = self.node('pedido', 'entity')
+        node['data']['properties'].append({'name': 'campo invalido!', 'type': 'String'})
+        with self.assertRaises(DiagramGenerationError) as caught:
+            generate_spring_boot_zip([node], [])
+        self.assertEqual(caught.exception.errors[0]['code'], 'invalid_java_identifier')
 
     def test_ai_operations_create_update_move_attributes_and_relations(self):
         nodes = [self.node('cliente', 'entity'), self.node('pedido', 'entity')]
@@ -425,6 +577,8 @@ class DiagramUmlContractTests(TestCase):
         with ZipFile(BytesIO(response.content)) as archive:
             names = archive.namelist()
             self.assertIn('ventas/pom.xml', names)
+            self.assertIn('ventas/.env.example', names)
+            self.assertIn('ventas/.gitignore', names)
             self.assertIn('ventas/src/main/java/com/example/ventas/model/Notificable.java', names)
             self.assertIn('ventas/src/main/resources/application.properties', names)
             persona = archive.read('ventas/src/main/java/com/example/ventas/entity/Persona.java').decode()
@@ -433,6 +587,8 @@ class DiagramUmlContractTests(TestCase):
             service = archive.read('ventas/src/main/java/com/example/ventas/service/PersonaService.java').decode()
             mapper = archive.read('ventas/src/main/java/com/example/ventas/mapper/PersonaMapper.java').decode()
             properties = archive.read('ventas/src/main/resources/application.properties').decode()
+            env_example = archive.read('ventas/.env.example').decode()
+            gitignore = archive.read('ventas/.gitignore').decode()
         self.assertIn('@Entity', persona)
         self.assertIn('class Cliente extends Persona implements Notificable', client)
         self.assertIn('@GetMapping', controller)
@@ -443,6 +599,12 @@ class DiagramUmlContractTests(TestCase):
         self.assertIn('findAll()', service)
         self.assertIn('toDto', mapper)
         self.assertIn('${DB_PASSWORD:}', properties)
+        self.assertIn('spring.config.import=optional:file:.env[.properties]', properties)
+        self.assertIn('DB_URL=jdbc:postgresql://localhost:5432/app', env_example)
+        self.assertIn('Copy-Item -LiteralPath ".env.example" -Destination ".env"', env_example)
+        self.assertNotIn('DB_PASSWORD=tu_clave', env_example)
+        self.assertIn('.env', gitignore)
+        self.assertNotIn('ventas/.env', names)
 
     def test_generator_uses_pascal_case_crud_and_skips_interface_layers(self):
         entity = self.node('auto', 'entity')
@@ -675,8 +837,8 @@ class DiagramUmlContractTests(TestCase):
         package = next(
             item for item in root.iter()
             if item.get(xmi_type) == 'uml:Package'
-            and item.get(f'{{{XMI}}}id') == 'dc-package-diagramcraft'
         )
+        self.assertTrue(package.get(f'{{{XMI}}}id').startswith('EAPK_'))
         self.assertEqual(package.get('name'), 'DiagramCraft')
         self.assertEqual(diagram.get('modelElement'), package.get(f'{{{XMI}}}id'))
         extension = root.find(f'{{{XMI}}}Extension')
@@ -685,29 +847,52 @@ class DiagramUmlContractTests(TestCase):
         self.assertIsNotNone(ea_diagram)
         self.assertEqual(ea_diagram.get(f'{{{XMI}}}id'), diagram.get(f'{{{XMI}}}id'))
         self.assertEqual(ea_diagram.find('model').get('owner'), package.get(f'{{{XMI}}}id'))
+        package_extension = extension.find('elements/element')
+        self.assertEqual(
+            package_extension.find('model').get('package2'),
+            package.get(f'{{{XMI}}}id').replace('EAPK_', 'EAID_', 1),
+        )
         self.assertEqual(ea_diagram.find('properties').get('name'), 'DiagramCraft')
         self.assertEqual(len(ea_diagram.find('elements')), 3 + 6)
+        self.assertEqual(len(extension.find('elements')), 1 + 3)
+        connectors = extension.find('connectors')
+        self.assertEqual(len(connectors), 6)
+        self.assertEqual(
+            {connector.get(f'{{{XMI}}}idref') for connector in connectors},
+            {edge.get('modelElement') for edge in diagram if edge.get(xmi_type) == 'umldi:UMLEdge'},
+        )
+        self.assertTrue(all(
+            connector.find('source') is not None and connector.find('target') is not None
+            for connector in connectors
+        ))
         xmi_ids = [
             item.get(f'{{{XMI}}}id') for item in root.iter()
             if item.get(f'{{{XMI}}}id')
         ]
         self.assertEqual(
             {value for value in xmi_ids if xmi_ids.count(value) > 1},
-            {'dc-diagram-0'},
+            {diagram.get(f'{{{XMI}}}id')},
         )
+        self.assertTrue(diagram.get(f'{{{XMI}}}id').startswith('EAID_'))
         shapes = [
             item for item in diagram
             if item.get(xmi_type) == 'umldi:UMLClassifierShape'
         ]
         self.assertEqual(len(shapes), 3)
+        classifier_ids = {
+            item.get(f'{{{XMI}}}id') for item in root.iter()
+            if item.get(xmi_type) in {'uml:Class', 'uml:Interface'}
+            and item.get(f'{{{XMI}}}id')
+        }
         self.assertEqual(
             {shape.get('modelElement') for shape in shapes},
-            {'dc-node-0', 'dc-node-1', 'dc-node-2'},
+            classifier_ids,
         )
+        self.assertTrue(all(value.startswith('EAID_') for value in classifier_ids))
         self.assertNotIn(b'EAID_existing_source', exported)
         self.assertNotIn(b'EAID_existing_target', exported)
         self.assertTrue(all(shape.find('bounds') is not None for shape in shapes))
-        source_shape = next(shape for shape in shapes if shape.get('modelElement') == 'dc-node-0')
+        source_shape = next(shape for shape in shapes if shape.find('bounds').get('x') == '120')
         self.assertEqual(source_shape.find('bounds').get('x'), '120')
         self.assertEqual(source_shape.find('bounds').get('y'), '240')
 
@@ -717,9 +902,12 @@ class DiagramUmlContractTests(TestCase):
         self.assertEqual(len(diagram_edges), 6)
         self.assertEqual(
             {edge.get('modelElement') for edge in diagram_edges},
-            {f'dc-rel-{index}' for index in range(6)},
+            {connector.get(f'{{{XMI}}}idref') for connector in connectors},
         )
         self.assertTrue(all(len(edge.findall('waypoint')) == 2 for edge in diagram_edges))
+        diagram_element_styles = [item.get('style', '') for item in ea_diagram.find('elements')]
+        self.assertEqual(sum('DUID=' in style for style in diagram_element_styles), 3)
+        self.assertEqual(sum('SOID=' in style and 'EOID=' in style for style in diagram_element_styles), 6)
 
         associations = [
             item for item in root.iter()
@@ -744,10 +932,10 @@ class DiagramUmlContractTests(TestCase):
         )
         self.assertEqual(aggregation_ends[0].get('aggregation'), 'shared')
 
-        association_edge = next(edge for edge in diagram_edges if edge.get('modelElement') == 'dc-rel-0')
+        association_edge = next(edge for edge in diagram_edges if edge.get('modelElement') == association.get(f'{{{XMI}}}id'))
         self.assertFalse(any(item.get(xmi_type) == 'umldi:UMLMultiplicityLabel'
                              for item in association_edge))
-        aggregation_edge = next(edge for edge in diagram_edges if edge.get('modelElement') == 'dc-rel-1')
+        aggregation_edge = next(edge for edge in diagram_edges if edge.get('modelElement') == aggregation.get(f'{{{XMI}}}id'))
         multiplicity_labels = [
             item for item in aggregation_edge
             if item.get(xmi_type) == 'umldi:UMLMultiplicityLabel'
@@ -755,7 +943,7 @@ class DiagramUmlContractTests(TestCase):
         self.assertEqual({item.get('text') for item in multiplicity_labels}, {'1', '0..*'})
         self.assertEqual(
             {item.get('modelElement') for item in multiplicity_labels},
-            {'dc-end-1-0', 'dc-end-1-1'},
+            {item.get(f'{{{XMI}}}id') for item in aggregation_ends},
         )
 
         imported = parse_xmi(exported)
@@ -767,7 +955,50 @@ class DiagramUmlContractTests(TestCase):
         self.assertEqual(composition['data']['ownerNodeId'], composition['data']['wholeNodeId'])
         imported_aggregation = next(edge for edge in imported['edges'] if edge['data']['relationType'] == 'agregacion')
         self.assertEqual(imported_aggregation['data']['multiplicidadOrigen'], '1')
-        self.assertEqual(imported_aggregation['data']['multiplicidadDestino'], '*')
+        self.assertEqual(imported_aggregation['data']['multiplicidadDestino'], '0..*')
+
+    def test_xmi_import_uses_ea_umldi_positions_and_export_names_the_diagram(self):
+        source = b'''<?xml version="1.0"?><xmi:XMI xmlns:xmi="http://www.omg.org/spec/XMI/20131001" xmlns:uml="http://www.omg.org/spec/UML/20131001" xmlns:umldi="http://www.omg.org/spec/UML/20131001/UMLDI" xmlns:dc="http://www.omg.org/spec/UML/20131001/UMLDC" xmi:version="2.5"><xmi:Documentation exporter="Enterprise Architect"/><uml:Model xmi:id="m"><packagedElement xmi:type="uml:Class" xmi:id="cliente" name="Cliente"/></uml:Model><umldi:Diagram xmi:type="umldi:UMLClassDiagram" xmi:id="d" modelElement="m"><ownedElement xmi:type="umldi:UMLClassifierShape" xmi:id="s" modelElement="cliente"><bounds xmi:type="dc:bounds" x="320" y="180" width="260" height="140"/></ownedElement></umldi:Diagram></xmi:XMI>'''
+        imported = parse_xmi(source)
+        self.assertEqual(imported['nodes'][0]['position'], {'x': 320, 'y': 180})
+        self.assertEqual(imported['nodes'][0]['width'], 260)
+        self.assertEqual(imported['nodes'][0]['height'], 140)
+
+        xml = export_xmi(imported['nodes'], imported['edges'], diagram_name='Finanzas')
+        root = etree.fromstring(xml)
+        self.assertEqual(root.find(f'{{{UMLDI}}}Diagram').get('name'), 'Finanzas')
+        self.assertEqual(
+            root.find(f'{{{XMI}}}Extension').find('diagrams/diagram/properties').get('name'),
+            'Finanzas',
+        )
+
+    def test_xmi_import_keeps_ea_connector_route_and_label_positions(self):
+        source = b'''<?xml version="1.0"?><xmi:XMI xmlns:xmi="http://www.omg.org/spec/XMI/20131001" xmlns:uml="http://www.omg.org/spec/UML/20131001" xmlns:umldi="http://www.omg.org/spec/UML/20131001/UMLDI" xmlns:dc="http://www.omg.org/spec/UML/20131001/UMLDC" xmi:version="2.5"><xmi:Documentation exporter="Enterprise Architect"/><uml:Model xmi:id="m"><packagedElement xmi:type="uml:Class" xmi:id="a" name="A"/><packagedElement xmi:type="uml:Class" xmi:id="b" name="B"/><packagedElement xmi:type="uml:Association" xmi:id="r" name="uses"><ownedEnd xmi:id="ea" type="a" lower="1" upper="1"/><ownedEnd xmi:id="eb" type="b" lower="0" upper="*"/></packagedElement></uml:Model><umldi:Diagram xmi:type="umldi:UMLClassDiagram" xmi:id="d" modelElement="m"><ownedElement xmi:type="umldi:UMLEdge" xmi:id="dr" source="a" target="b" modelElement="r"><ownedElement xmi:type="umldi:UMLMultiplicityLabel" text="1" modelElement="ea"><bounds xmi:type="dc:bounds" x="101" y="102"/></ownedElement><ownedElement xmi:type="umldi:UMLMultiplicityLabel" text="0..*" modelElement="eb"><bounds xmi:type="dc:bounds" x="301" y="302"/></ownedElement><ownedElement xmi:type="umldi:UMLNameLabel" text="uses"><bounds xmi:type="dc:bounds" x="201" y="202"/></ownedElement><waypoint xmi:type="dc:waypoint" x="100" y="100"/><waypoint xmi:type="dc:waypoint" x="200" y="150"/><waypoint xmi:type="dc:waypoint" x="300" y="300"/></ownedElement></umldi:Diagram></xmi:XMI>'''
+        imported = parse_xmi(source)
+        data = imported['edges'][0]['data']
+        self.assertEqual(data['xmiWaypoints'], [{'x': 100, 'y': 100}, {'x': 200, 'y': 150}, {'x': 300, 'y': 300}])
+        self.assertEqual(data['xmiLabelPositions'], {'source': {'x': 101, 'y': 102}, 'target': {'x': 301, 'y': 302}, 'name': {'x': 201, 'y': 202}})
+        self.assertEqual(data['multiplicidadDestino'], '0..*')
+
+    def test_xmi_import_normalizes_ea_java_primitive_ids_before_generation(self):
+        source = b'''<?xml version="1.0"?><xmi:XMI xmlns:xmi="http://www.omg.org/spec/XMI/20131001" xmlns:uml="http://www.omg.org/spec/UML/20131001" xmi:version="2.5"><xmi:Documentation exporter="Enterprise Architect"/><uml:Model xmi:id="m"><packagedElement xmi:type="uml:Class" xmi:id="saldo" name="Saldo"><ownedAttribute xmi:type="uml:Property" name="monto"><type xmi:idref="EAJava_int"/></ownedAttribute></packagedElement><packagedElement xmi:type="uml:PrimitiveType" xmi:id="EAJava_int" name="int"/></uml:Model></xmi:XMI>'''
+        imported = parse_xmi(source)
+        self.assertEqual(imported['nodes'][0]['data']['properties'][0]['type'], 'Integer')
+        archive, _ = generate_spring_boot_zip(imported['nodes'], imported['edges'])
+        with ZipFile(BytesIO(archive)) as generated:
+            java = generated.read('diagramcraft-generated/src/main/java/com/diagramcraft/generated/model/Saldo.java').decode()
+        self.assertIn('private Integer monto;', java)
+        self.assertNotIn('EAJava_int', java)
+
+    def test_xmi_import_normalizes_sql_attribute_captions(self):
+        source = b'''<?xml version="1.0"?><xmi:XMI xmlns:xmi="http://www.omg.org/spec/XMI/20131001" xmlns:uml="http://www.omg.org/spec/UML/20131001" xmi:version="2.5"><xmi:Documentation exporter="Enterprise Architect"/><uml:Model xmi:id="m"><packagedElement xmi:type="uml:Class" xmi:id="servicio" name="servicio"><ownedAttribute xmi:type="uml:Property" name="porcentaje de bonificacion"/><ownedAttribute xmi:type="uml:Property" name="tipo(FK; tipo_servicio)"/></packagedElement><packagedElement xmi:type="uml:Class" xmi:id="tipo_servicio" name="tipo_servicio"/></uml:Model></xmi:XMI>'''
+        imported = parse_xmi(source)
+        attributes = imported['nodes'][0]['data']['properties']
+        self.assertEqual(attributes[0]['name'], 'porcentajeDeBonificacion')
+        self.assertEqual(attributes[0]['sourceLabel'], 'porcentaje de bonificacion')
+        self.assertEqual(attributes[1]['name'], 'tipo')
+        self.assertEqual(attributes[1]['foreignTable'], 'tipo_servicio')
+        self.assertFalse(any(edge['data'].get('legacyForeignKey') for edge in imported['edges']))
 
     def test_xmi_export_keeps_parallel_associations_with_distinct_labels(self):
         source = self.node('source', 'entity')
@@ -876,6 +1107,20 @@ class DiagramUmlContractTests(TestCase):
         invalid = self.patch_document([invalid_embedded], [])
         self.assertEqual(invalid.status_code, 400)
         self.assertIn('nodes', invalid.json())
+
+    def test_canvas_can_save_incomplete_entity_while_generator_reports_identifier(self):
+        draft = self.node('borrador', 'entity')
+        draft['data']['properties'] = []
+        saved = self.patch_document([draft], [])
+        self.assertEqual(saved.status_code, 200)
+
+        response = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/generar-spring-boot/',
+            {'artifact': 'borrador', 'package': 'com.example.borrador'},
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['errors'][0]['code'], 'entity_identifier_required')
 
     def test_editor_cannot_generate_and_invalid_documents_return_errors(self):
         editor = get_user_model().objects.create_user(username='editor', password='clave-segura')

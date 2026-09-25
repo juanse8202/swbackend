@@ -2,6 +2,7 @@ import re
 
 from rest_framework import serializers
 from .models import Diagrama, ClaseUML, AtributoUML, RelacionUML, VersionDiagrama
+from .foreign_keys import normalize_legacy_foreign_keys
 
 class AtributoUMLSerializer(serializers.ModelSerializer):
     class Meta:
@@ -52,6 +53,7 @@ class DiagramaSerializer(serializers.ModelSerializer):
         'manyToMany': 'asociacion',
     }
     MULTIPLICITY_PATTERN = re.compile(r'^(?:N|\*|1|0\.\.1|0\.\.\*|1\.\.\*)$')
+    UML_MULTIPLICITY_PATTERN = re.compile(r'^(?:N|\*|\d+(?:\.\.(?:\d+|\*))?)$')
     JAVA_MEMBER_PATTERN = re.compile(r'^[A-Za-z_$][A-Za-z0-9_$]*$')
 
     class Meta:
@@ -76,11 +78,16 @@ class DiagramaSerializer(serializers.ModelSerializer):
         return relation_type
 
     @classmethod
-    def _validate_multiplicity(cls, value, field_name, edge_id):
+    def _validate_multiplicity(cls, value, field_name, edge_id, *, jpa_managed=True):
         if value in (None, ''):
             return
-        if not isinstance(value, str) or not cls.MULTIPLICITY_PATTERN.fullmatch(value.strip()):
+        pattern = cls.MULTIPLICITY_PATTERN if jpa_managed else cls.UML_MULTIPLICITY_PATTERN
+        if not isinstance(value, str) or not pattern.fullmatch(value.strip()):
             raise cls._edge_error(edge_id, f'{field_name} debe ser 1, 0..1, *, 0..* o 1..*.')
+        if '..' in value:
+            lower, upper = value.strip().split('..')
+            if upper != '*' and int(lower) > int(upper):
+                raise cls._edge_error(edge_id, f'{field_name} tiene límites invertidos.')
 
     @classmethod
     def _edge_error(cls, edge_id, message):
@@ -89,10 +96,27 @@ class DiagramaSerializer(serializers.ModelSerializer):
             'message': message,
         })
 
+    @staticmethod
+    def _jpa_managed(data, source_kind, target_kind):
+        """Infer persistence intent safely for documents created before the flag."""
+        value = data.get('jpaManaged')
+        if value is None:
+            return source_kind == 'entity' and target_kind == 'entity'
+        if not isinstance(value, bool):
+            raise serializers.ValidationError('jpaManaged debe ser verdadero o falso.')
+        return value
+
     def validate(self, attrs):
         instance = getattr(self, 'instance', None)
         nodes = attrs.get('nodes', instance.nodes if instance else [])
         edges = attrs.get('edges', instance.edges if instance else [])
+
+        # Old schema imports used a visual SQL label as ``properties[].name``.
+        # Make its semantics explicit in the JSON document before validating
+        # the rest of the UML/JPA contract.
+        nodes, edges, _warnings = normalize_legacy_foreign_keys(nodes, edges)
+        attrs['nodes'] = nodes
+        attrs['edges'] = edges
 
         if not isinstance(nodes, list):
             raise serializers.ValidationError({'nodes': 'nodes debe ser una lista.'})
@@ -116,7 +140,7 @@ class DiagramaSerializer(serializers.ModelSerializer):
             data = node.get('data') or {}
             if not isinstance(data, dict):
                 raise serializers.ValidationError({'nodes': {index: {'data': 'data debe ser un objeto.'}}})
-            kind = data.get('kind')
+            kind = data.get('kind', 'entity')
             if kind is not None and kind not in self.NODE_KINDS:
                 raise serializers.ValidationError({
                     'nodes': {index: {'data': {'kind': 'Tipo de nodo no soportado.'}}}
@@ -131,15 +155,18 @@ class DiagramaSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     'nodes': {index: {'data': {'properties': 'Cada atributo debe ser un objeto.'}}}
                 })
-            id_count = sum('(@Id)' in str(item.get('type', '')) for item in properties)
-            if kind == 'entity' and id_count != 1:
-                raise serializers.ValidationError({
-                    'nodes': {index: {'data': {'properties': 'Una entidad requiere exactamente un atributo @Id.'}}}
-                })
-            if kind in {'interface', 'dto', 'embeddable'} and id_count:
-                raise serializers.ValidationError({
-                    'nodes': {index: {'data': {'properties': f'Un nodo {kind} no puede declarar @Id.'}}}
-                })
+            for property_index, property_ in enumerate(properties):
+                name = property_.get('name')
+                if not isinstance(name, str) or not self.JAVA_MEMBER_PATTERN.fullmatch(name.strip()):
+                    raise serializers.ValidationError({
+                        'nodes': {index: {'data': {'properties': {property_index: {
+                            'name': 'Debe ser un identificador Java válido. Los formatos legacy campo(FK: tabla) se convierten automáticamente.'
+                        }}}}}
+                    })
+            # A canvas is allowed to contain incomplete work while it is being
+            # modeled (for example a newly-created entity before its id is
+            # added).  Identifier rules belong to Spring generation, where we
+            # can report every offending element without blocking autosave.
             if kind == 'interface' and any(item.get('persistent') for item in properties):
                 raise serializers.ValidationError({
                     'nodes': {index: {'data': {'properties': 'Una interface no puede tener atributos persistentes.'}}}
@@ -193,27 +220,32 @@ class DiagramaSerializer(serializers.ModelSerializer):
             try:
                 relation_type = self._relation_type(edge)
                 data = edge.get('data') or {}
-                self._validate_multiplicity(data.get('multiplicidadOrigen'), 'multiplicidadOrigen', edge_id)
-                self._validate_multiplicity(data.get('multiplicidadDestino'), 'multiplicidadDestino', edge_id)
             except serializers.ValidationError as error:
                 raise serializers.ValidationError({'edges': {index: error.detail}}) from error
 
             source_kind = node_kinds[source]
             target_kind = node_kinds[target]
-            annotation = data.get('jpaAnnotation')
+            jpa_managed = False
             if relation_type in {'asociacion', 'agregacion', 'composicion'}:
                 # XMI can describe a pure UML association between ordinary
                 # classes.  It is kept in the diagram, but must never be
                 # treated as a JPA relation by the Spring generator.
-                jpa_managed = data.get('jpaManaged', True)
-                if not isinstance(jpa_managed, bool):
+                try:
+                    jpa_managed = self._jpa_managed(data, source_kind, target_kind)
+                except serializers.ValidationError as error:
                     raise serializers.ValidationError({'edges': {index: self._edge_error(
-                        edge_id, 'jpaManaged debe ser verdadero o falso.'
+                        edge_id, error.detail[0]
                     ).detail}})
                 if (source_kind != 'entity' or target_kind != 'entity') and jpa_managed:
                     raise serializers.ValidationError({'edges': {index: self._edge_error(
                         edge_id, 'Las relaciones JPA solo pueden unir entidades.'
                     ).detail}})
+            try:
+                for field in ('multiplicidadOrigen', 'multiplicidadDestino'):
+                    self._validate_multiplicity(data.get(field), field, edge_id, jpa_managed=jpa_managed)
+            except serializers.ValidationError as error:
+                raise serializers.ValidationError({'edges': {index: error.detail}}) from error
+            if relation_type in {'asociacion', 'agregacion', 'composicion'}:
                 if not jpa_managed:
                     # Association/aggregation/composition UML no persistente:
                     # preserve its endpoint semantics and multiplicities as

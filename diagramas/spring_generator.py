@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from jinja2 import DictLoader, Environment, StrictUndefined
+from .foreign_keys import normalize_legacy_foreign_keys
 
 
 JAVA_IDENTIFIER = re.compile(r'^[A-Za-z_$][A-Za-z0-9_$]*$')
@@ -79,7 +80,18 @@ def _java_class_name(value, *, element_id, label):
 def _java_type(value):
     value = str(value or 'String').strip()
     value = re.sub(r'\s*\(@Id\)\s*$', '', value)
-    aliases = {'string': 'String', 'integer': 'Integer', 'int': 'Integer', 'uuid': 'UUID', 'long': 'Long', 'decimal': 'BigDecimal', 'boolean': 'Boolean'}
+    # Existing diagrams imported from EA before type normalization may still
+    # carry EA's private primitive IDs.  Keep generation backwards compatible
+    # and never emit them as non-existent Java classes.
+    aliases = {
+        'string': 'String', 'eajava_string': 'String',
+        'integer': 'Integer', 'int': 'Integer', 'eajava_int': 'Integer',
+        'long': 'Long', 'eajava_long': 'Long',
+        'decimal': 'BigDecimal', 'boolean': 'Boolean', 'eajava_boolean': 'Boolean',
+        'float': 'Float', 'eajava_float': 'Float',
+        'double': 'Double', 'eajava_double': 'Double',
+        'char': 'Character', 'eajava_char': 'Character', 'uuid': 'UUID',
+    }
     return aliases.get(value.lower(), value)
 
 
@@ -146,6 +158,7 @@ def normalize_diagram(nodes, edges):
             errors.append({'code': 'invalid_attributes', 'element_id': node_id, 'message': 'properties debe ser una lista.'})
             continue
         normalized_attributes = []
+        used_attribute_names = set()
         for attribute in attributes:
             if not isinstance(attribute, dict):
                 errors.append({'code': 'invalid_attribute', 'element_id': node_id, 'message': 'Atributo inválido.'})
@@ -155,6 +168,24 @@ def normalize_diagram(nodes, edges):
             except DiagramGenerationError as error:
                 errors.extend(error.errors)
                 continue
+            if attribute_name in used_attribute_names:
+                # Old EA imports may already have normalized a descriptive FK
+                # to the same Java name as a scalar column.  Preserve the
+                # original JSON, but make the generated model unambiguous.
+                if attribute.get('sourceLabel') or attribute.get('sqlForeignKey') or attribute.get('foreignKeyMode'):
+                    base, suffix = f'{attribute_name}_id', 2
+                    attribute_name = base
+                    while attribute_name in used_attribute_names:
+                        attribute_name = f'{base}_{suffix}'
+                        suffix += 1
+                else:
+                    errors.append({
+                        'code': 'duplicate_java_attribute', 'element_id': node_id,
+                        'attribute_name': attribute_name,
+                        'message': f'El atributo {attribute_name!r} está repetido en la clase {name}.',
+                    })
+                    continue
+            used_attribute_names.add(attribute_name)
             attribute_type = _java_type(attribute.get('type'))
             is_id = '(@Id)' in str(attribute.get('type', ''))
             normalized_attributes.append({
@@ -164,6 +195,7 @@ def normalize_diagram(nodes, edges):
                 'accessor': attribute_name[:1].upper() + attribute_name[1:],
                 'generated': is_id and attribute_type in {'UUID', 'Long'},
                 'embedded': bool(attribute.get('embedded')),
+                'foreignKeyMode': attribute.get('foreignKeyMode'),
             })
         id_attributes = [attribute for attribute in normalized_attributes if attribute['id']]
         if kind == 'entity' and len(id_attributes) != 1:
@@ -252,12 +284,14 @@ def normalize_diagram(nodes, edges):
                 continue
             source.interfaces.append(target_id)
         elif relation_type in {'asociacion', 'agregacion', 'composicion'}:
+            raw_jpa_managed = data.get('jpaManaged')
+            if raw_jpa_managed is not None and not isinstance(raw_jpa_managed, bool):
+                errors.append(_edge_error('invalid_jpa_managed', edge_id, 'jpaManaged debe ser verdadero o falso.'))
+                continue
+            jpa_managed = raw_jpa_managed if raw_jpa_managed is not None else (source.persistent and target.persistent)
+            if not jpa_managed:
+                continue
             if not source.persistent or not target.persistent:
-                if data.get('jpaManaged') is False:
-                    # A relationship imported from XMI between ordinary UML
-                    # classes is model metadata, not a JPA mapping.  Keep it
-                    # in Diagrama.edges but do not invent persistence fields.
-                    continue
                 errors.append(_edge_error('invalid_jpa_relationship', edge_id, 'Una relación JPA solo puede unir dos entidades persistentes.'))
                 continue
             source_multiplicity = data.get('multiplicidadOrigen') or '1'
@@ -304,6 +338,7 @@ def normalize_diagram(nodes, edges):
                 'cascade': relation_type == 'composicion',
                 'join_column': f'{owner_role}_id',
                 'join_table': f'{owner.name.lower()}_{other.name.lower()}',
+                'legacy_foreign_key': bool(data.get('legacyForeignKey')),
             })
             if bool(data.get('bidirectional', False)):
                 inverse_annotation = {
@@ -327,6 +362,16 @@ def normalize_diagram(nodes, edges):
     if errors:
         raise DiagramGenerationError(errors)
     for node in result.values():
+        # A legacy FK resolved into a managed association remains in nodes
+        # JSON for round trips, but must not generate a duplicate scalar.
+        managed_fk_fields = {
+            relation['name'] for relation in node.relations
+            if relation.get('legacy_foreign_key') and relation['owner']
+        }
+        node.attributes = [
+            attribute for attribute in node.attributes
+            if not (attribute.get('foreignKeyMode') == 'relation' and attribute['name'] in managed_fk_fields)
+        ]
         used_names = {attribute['name'] for attribute in node.attributes}
         for relation in node.relations:
             if relation['name'] in used_names:
@@ -344,6 +389,39 @@ def normalize_diagram(nodes, edges):
 
 TEMPLATES = {
     'pom.xml': '''<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>{{ package }}</groupId><artifactId>{{ artifact }}</artifactId><version>0.0.1-SNAPSHOT</version><parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>3.4.0</version></parent><properties><java.version>21</java.version></properties><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency><dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency></dependencies><build><plugins><plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></build></project>''',
+    'application.properties': '''# Carga credenciales locales desde .env cuando exista. No subas .env a Git.
+spring.config.import=optional:file:.env[.properties]
+
+spring.datasource.url=${DB_URL:jdbc:postgresql://localhost:5432/app}
+spring.datasource.username=${DB_USERNAME:postgres}
+spring.datasource.password=${DB_PASSWORD:}
+spring.jpa.hibernate.ddl-auto=${JPA_DDL_AUTO:update}
+spring.jpa.open-in-view=false
+''',
+    '.env.example': '''# PowerShell: Copy-Item -LiteralPath ".env.example" -Destination ".env"
+# Copia este archivo como .env y usa tus credenciales locales.
+# Nunca incluyas .env en Git ni en un ZIP compartido.
+DB_URL=jdbc:postgresql://localhost:5432/app
+DB_USERNAME=postgres
+DB_PASSWORD=
+JPA_DDL_AUTO=update
+''',
+    '.gitignore': '''.env
+target/
+.idea/
+*.iml
+''',
+    'README.md': '''# {{ artifact }}
+
+## Configuración local
+
+1. Copia `.env.example` como `.env`.
+2. Completa `DB_URL`, `DB_USERNAME` y `DB_PASSWORD` con tus credenciales locales.
+3. En IntelliJ selecciona un JDK 21 e importa `pom.xml` como proyecto Maven.
+4. Ejecuta `Application` o usa `./mvnw spring-boot:run`.
+
+El archivo `.env` se carga automáticamente al iniciar Spring Boot y está ignorado por Git. No compartas ni subas credenciales reales.
+''',
     'application.java': '''package {{ package }};
 
 import org.springframework.boot.SpringApplication;
@@ -627,9 +705,10 @@ def _render_project(nodes, package, artifact, directory):
         target.write_text(environment.get_template(template).render(package=package, artifact=artifact, **context), encoding='utf-8')
     write('pom.xml', 'pom.xml')
     write(Path('src/main/java') / package_path / 'Application.java', 'application.java')
-    write('src/main/resources/application.properties', None) if False else (directory / 'src/main/resources').mkdir(parents=True, exist_ok=True)
-    (directory / 'src/main/resources/application.properties').write_text('spring.datasource.url=${DB_URL:jdbc:postgresql://localhost:5432/app}\nspring.datasource.username=${DB_USERNAME:postgres}\nspring.datasource.password=${DB_PASSWORD:}\nspring.jpa.hibernate.ddl-auto=update\n', encoding='utf-8')
-    (directory / 'README.md').write_text(f'# {artifact}\n\nConfigure DB_URL, DB_USERNAME y DB_PASSWORD antes de ejecutar `./mvnw spring-boot:run`.\n', encoding='utf-8')
+    write('src/main/resources/application.properties', 'application.properties')
+    write('.env.example', '.env.example')
+    write('.gitignore', '.gitignore')
+    write('README.md', 'README.md')
     by_id = {node.identifier: node for node in nodes}
     by_name = {node.name: node for node in nodes}
 
@@ -705,12 +784,13 @@ def _render_project(nodes, package, artifact, directory):
                 )
 
 
-def generate_spring_boot_zip(nodes, edges, *, artifact='diagramcraft-generated', package='com.diagramcraft.generated'):
+def generate_spring_boot_zip(nodes, edges, *, artifact='diagramcraft-generated', package='com.diagramcraft.generated', return_warnings=False):
     if not PACKAGE_NAME.fullmatch(package):
         raise DiagramGenerationError([{'code': 'invalid_package', 'message': 'El paquete Java debe tener al menos dos segmentos en minúsculas.'}])
     artifact = re.sub(r'[^a-z0-9-]', '-', str(artifact).lower()).strip('-')
     if not artifact:
         raise DiagramGenerationError([{'code': 'invalid_artifact', 'message': 'artifact debe contener letras, números o guiones.'}])
+    nodes, edges, warnings = normalize_legacy_foreign_keys(nodes, edges)
     model = normalize_diagram(nodes, edges)
     with tempfile.TemporaryDirectory(prefix='diagramcraft-spring-') as temporary:
         root = Path(temporary) / artifact
@@ -721,4 +801,5 @@ def generate_spring_boot_zip(nodes, edges, *, artifact='diagramcraft-generated',
             for source in sorted(root.rglob('*')):
                 if source.is_file():
                     zip_file.write(source, source.relative_to(root.parent))
-        return archive.read_bytes(), f'{artifact}.zip'
+        result = (archive.read_bytes(), f'{artifact}.zip')
+        return (*result, warnings) if return_warnings else result
