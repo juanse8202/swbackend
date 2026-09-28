@@ -55,10 +55,12 @@ class DiagramaSerializer(serializers.ModelSerializer):
     MULTIPLICITY_PATTERN = re.compile(r'^(?:N|\*|1|0\.\.1|0\.\.\*|1\.\.\*)$')
     UML_MULTIPLICITY_PATTERN = re.compile(r'^(?:N|\*|\d+(?:\.\.(?:\d+|\*))?)$')
     JAVA_MEMBER_PATTERN = re.compile(r'^[A-Za-z_$][A-Za-z0-9_$]*$')
+    expected_revision = serializers.IntegerField(write_only=True, required=False, min_value=0)
 
     class Meta:
         model = Diagrama
         fields = '__all__'
+        read_only_fields = ['revision']
 
     @classmethod
     def _relation_type(cls, edge):

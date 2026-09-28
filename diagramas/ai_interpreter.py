@@ -7,6 +7,8 @@ capability, and the view validates every proposal with ``execute_operations``.
 
 import json
 import os
+import re
+from uuid import uuid4
 
 from django.conf import settings
 
@@ -17,6 +19,123 @@ class AiProviderError(RuntimeError):
 
 class AiInterpretationError(ValueError):
     """An invalid, unsafe, or ambiguous request/response payload."""
+
+
+PROJECT_CREATE_PATTERN = re.compile(
+    r'^\s*(?:diana\s*,?\s*)?(?:crea|crear|quiero\s+crear)\s+(?:un\s+)?proyecto'
+    r'(?:\s+(?:llamado|denominado))?(?:\s+(?P<name>.+?))?\s*[.!?]*\s*$',
+    re.IGNORECASE,
+)
+CLASS_CREATE_PATTERN = re.compile(
+    r'^\s*(?:diana\s*,?\s*)?(?:crea|crear)\s+(?:una?\s+)?'
+    r'(?P<kind>clase|entidad|interfaz)\s+(?:llamada?\s+)?(?P<body>.+?)\s*[.!?]*\s*$',
+    re.IGNORECASE,
+)
+
+
+def project_create_proposal(instruction):
+    """Recognize the small, explicit project-creation grammar before Gemini.
+
+    This guarantees that project names come from the user's words and that an
+    incomplete request asks a predictable clarification instead of inventing a
+    project name.  All other modelling instructions continue to use Gemini.
+    """
+    match = PROJECT_CREATE_PATTERN.match(instruction or '')
+    if not match:
+        return None
+    name = (match.group('name') or '').strip(' \t\r\n.,;:')
+    if not name:
+        return {
+            'status': 'clarification',
+            'summary': '',
+            'question': '¿Qué nombre deseas para el proyecto?',
+            'candidates': [],
+            'operations': [],
+        }
+    return {
+        'status': 'ready',
+        'summary': f'Crear proyecto {name}.',
+        'question': '',
+        'candidates': [],
+        'operations': [{
+            'id': str(uuid4()),
+            'op': 'project.create',
+            'payload': {'name': name, 'create_main_diagram': True},
+        }],
+    }
+
+
+def class_create_proposal(instruction):
+    """Build a typed plan for the explicit Spanish class creation grammar.
+
+    This small parser intentionally runs before the remote provider, so the
+    common voice commands work even when Gemini is unavailable.  It never
+    writes a document: the returned operation still goes through the normal
+    plan, confirmation and atomic apply boundary.
+    """
+    match = CLASS_CREATE_PATTERN.match(instruction or '')
+    if not match:
+        return None
+
+    label = match.group('kind').lower()
+    kind = {'clase': 'class', 'entidad': 'entity', 'interfaz': 'interface'}[label]
+    parts = re.split(r'\s+con\s+', match.group('body').strip(), maxsplit=1, flags=re.IGNORECASE)
+    name = ''.join(parts[0].strip(' \t\r\n.,;:').split())
+    attributes_part = parts[1].strip(' \t\r\n.,;:') if len(parts) == 2 else ''
+    if not name:
+        return {
+            'status': 'clarification', 'summary': '',
+            'question': 'Indica el nombre de la clase, entidad o interfaz.',
+            'candidates': [], 'operations': [],
+        }
+    if not re.fullmatch(r'[^\W\d]\w*', name, flags=re.UNICODE):
+        return {
+            'status': 'clarification', 'summary': '',
+            'question': 'El nombre debe comenzar con una letra y no contener simbolos.',
+            'candidates': [], 'operations': [],
+        }
+
+    properties = []
+    if attributes_part:
+        attribute_text = re.sub(r'^(?:los\s+)?atributos?\s+', '', attributes_part, flags=re.IGNORECASE)
+        chunks = [part.strip(' \t\r\n.,;:') for part in re.split(r'\s*(?:,|;|\by\b)\s*', attribute_text, flags=re.IGNORECASE)]
+        for chunk in filter(None, chunks):
+            attribute = re.fullmatch(
+                r'(?:el\s+)?(?:atributo\s+)?(?P<name>[^\s,;]+)\s+'
+                r'(?:de\s+tipo\s+)?(?P<type>[A-Za-z_][\w<>\[\],?]*)',
+                chunk,
+                flags=re.IGNORECASE,
+            )
+            if not attribute:
+                return {
+                    'status': 'clarification', 'summary': '',
+                    'question': f'No entendi el atributo "{chunk}". Di por ejemplo: nombre de tipo String.',
+                    'candidates': [], 'operations': [],
+                }
+            properties.append({
+                'name': attribute.group('name'), 'type': attribute.group('type'),
+                'visibility': 'private',
+            })
+    if kind == 'interface' and properties:
+        return {
+            'status': 'clarification', 'summary': '',
+            'question': 'Una interfaz no puede crearse con atributos. Indica solo su nombre o agrega metodos despues.',
+            'candidates': [], 'operations': [],
+        }
+
+    property_summary = ''
+    if properties:
+        rendered = [f"{item['name']} de tipo {item['type']}" for item in properties]
+        article = 'el atributo' if len(rendered) == 1 else 'los atributos'
+        property_summary = f" con {article} " + ', '.join(rendered)
+    return {
+        'status': 'ready', 'summary': f'Crear {label} {name}{property_summary}.',
+        'question': '', 'candidates': [],
+        'operations': [{
+            'op': 'create_node', 'kind': kind, 'title': name,
+            'properties': properties,
+        }],
+    }
 
 
 class GeminiInterpreter:
@@ -107,7 +226,7 @@ def validate_interpret_request(payload, nodes, edges):
     """Strictly validate untrusted HTTP input before the remote call."""
     if not isinstance(payload, dict):
         raise AiInterpretationError('El cuerpo debe ser un objeto JSON.')
-    unknown = set(payload) - {'instruction', 'selection'}
+    unknown = set(payload) - {'instruction', 'selection', 'expected_revision', 'request_id'}
     if unknown:
         raise AiInterpretationError(f'Claves no permitidas: {", ".join(sorted(unknown))}.')
     instruction = payload.get('instruction')
@@ -129,7 +248,15 @@ def validate_interpret_request(payload, nodes, edges):
             raise AiInterpretationError(f'{field} contiene un ID inexistente.')
         if len(values) != len(set(values)):
             raise AiInterpretationError(f'{field} no puede repetir IDs.')
-    return instruction.strip(), {'node_ids': node_ids, 'edge_ids': edge_ids}
+    expected_revision = payload.get('expected_revision')
+    if expected_revision is not None and (
+        isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0
+    ):
+        raise AiInterpretationError('expected_revision debe ser un entero no negativo.')
+    request_id = payload.get('request_id')
+    if request_id is not None and (not isinstance(request_id, str) or not request_id or len(request_id) > 128):
+        raise AiInterpretationError('request_id debe ser texto no vacio de hasta 128 caracteres.')
+    return instruction.strip(), {'node_ids': node_ids, 'edge_ids': edge_ids}, expected_revision, request_id
 
 
 def validate_provider_response(payload, nodes, edges):
@@ -176,8 +303,10 @@ def _prompt(context):
         'Devuelve exclusivamente JSON conforme al esquema. No ejecutes codigo, comandos, SQL, URLs '
         'ni acciones fuera de estas operaciones: create_node, update_node, move_node, delete_node, '
         'add_attribute, update_attribute, remove_attribute, create_relation, update_relation, '
-        'delete_relation. Usa IDs del contexto; para elementos nuevos usa temp_id. '
+        'delete_relation, project.create. project.create requiere un id UUID y payload con name y create_main_diagram=true. '
+        'Usa IDs del contexto; para elementos nuevos usa temp_id. '
         'Si hay ambiguedad, devuelve status clarification, una pregunta y candidatos que sean IDs del contexto. '
+        'Si el usuario pide crear proyecto y no da un nombre claro, devuelve clarification. '
         'No inventes permisos ni modifiques el proyecto.\n\n'
         f'Contexto seguro: {json.dumps(context, ensure_ascii=False, separators=(",", ":"))}'
     )

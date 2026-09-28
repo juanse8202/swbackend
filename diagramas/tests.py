@@ -7,14 +7,18 @@ from copy import deepcopy
 from datetime import timedelta
 from unittest.mock import patch
 
+from asgiref.sync import async_to_sync
+
 from lxml import etree
 from django.utils import timezone
 
 from proyectos.models import Proyecto, ProyectoMiembro
+from proyectos.services import create_project_with_main_diagram
 from .models import Diagrama, PlanIA
 from .ai_operations import OperationError, execute_operations
 from .ai_interpreter import AiProviderError
 from .ai_plans import create_plan
+from .consumers import save_diagram_if_user_can_access
 from .spring_generator import DiagramGenerationError, generate_spring_boot_zip
 from .foreign_keys import normalize_legacy_foreign_keys
 from .xmi import UMLDI, XMI, XmiError, export_xmi, parse_xmi
@@ -63,12 +67,46 @@ class DiagramUmlContractTests(TestCase):
             'data': {'relationType': relation_type, 'multiplicidadOrigen': '1', 'multiplicidadDestino': '1'},
         }
 
-    def patch_document(self, nodes, edges):
+    def patch_document(self, nodes, edges, *, expected_revision=None):
+        self.diagram.refresh_from_db(fields=['revision'])
         return self.client.patch(
             f'/api/diagramas/diagramas/{self.diagram.id}/',
-            {'nodes': nodes, 'edges': edges},
+            {
+                'nodes': nodes, 'edges': edges,
+                'expected_revision': self.diagram.revision if expected_revision is None else expected_revision,
+            },
             content_type='application/json',
         )
+
+    def test_document_writes_require_matching_expected_revision(self):
+        nodes = [self.node('cliente', 'entity')]
+        missing = self.client.patch(
+            f'/api/diagramas/diagramas/{self.diagram.id}/',
+            {'nodes': nodes, 'edges': []}, content_type='application/json',
+        )
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.json()['code'], 'expected_revision_required')
+
+        saved = self.patch_document(nodes, [])
+        self.assertEqual(saved.status_code, 200)
+        stale = self.patch_document(nodes, [], expected_revision=0)
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()['code'], 'stale_revision')
+        self.assertEqual(stale.json()['current_revision'], 1)
+
+    def test_websocket_save_rejects_stale_snapshot_without_overwrite(self):
+        first_nodes = [self.node('cliente', 'entity')]
+        first = async_to_sync(save_diagram_if_user_can_access)(
+            self.user.id, self.diagram.id, first_nodes, [], 0,
+        )
+        self.assertEqual(first['status'], 'saved')
+        stale = async_to_sync(save_diagram_if_user_can_access)(
+            self.user.id, self.diagram.id, [self.node('pedido', 'entity')], [], 0,
+        )
+        self.assertEqual(stale['status'], 'stale_revision')
+        self.assertEqual(stale['error']['code'], 'stale_revision')
+        self.diagram.refresh_from_db()
+        self.assertEqual(self.diagram.nodes, first_nodes)
 
     def test_uml_association_between_classes_is_compatible_without_jpa_flag(self):
         """Old and EA-style UML associations must not be reinterpreted as JPA."""
@@ -309,6 +347,7 @@ class DiagramUmlContractTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['status'], 'ready')
         self.assertIn('plan_id', response.json())
+        self.assertEqual(response.json()['destructive_impact'], {'nodes': [], 'edges': []})
         self.assertEqual(provider.contexts[0]['selection']['node_ids'], ['cliente'])
         self.diagram.refresh_from_db()
         self.assertEqual(self.diagram.nodes[0]['data']['title'], 'cliente.java')
@@ -351,6 +390,12 @@ class DiagramUmlContractTests(TestCase):
                 {'instruction': 'haz algo'}, content_type='application/json',
             )
         self.assertEqual(failure_response.status_code, 400)
+        self.assertEqual(failure_response.json(), {
+            'code': 'ai_interpretation_failed',
+            'message': 'network',
+            'target': None,
+            'current_revision': 0,
+        })
         self.diagram.refresh_from_db()
         self.assertEqual(self.diagram.nodes[0]['id'], 'cliente')
 
@@ -399,6 +444,123 @@ class DiagramUmlContractTests(TestCase):
         self.assertEqual(self.diagram.nodes[0]['data']['title'], 'Persona.java')
         self.assertEqual(self.diagram.revision, 1)
 
+    def test_ai_project_create_requires_confirmation_and_returns_authoritative_project(self):
+        operation = {
+            'id': '4a8cfb73-84d6-4f5d-bd4a-3e7fddd23412',
+            'op': 'project.create',
+            'payload': {'name': 'Sistema de Ventas', 'create_main_diagram': True},
+        }
+        plan = create_plan(user=self.user, diagram=self.diagram, operations=[operation])
+        payload = {'plan_id': str(plan.plan_id), 'idempotency_key': 'create-sales-project', 'confirm': False}
+        denied = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/', payload,
+            content_type='application/json',
+        )
+        self.assertEqual(denied.status_code, 400)
+        self.assertEqual(denied.json()['code'], 'confirmation_required')
+
+        payload['confirm'] = True
+        created = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/', payload,
+            content_type='application/json',
+        )
+        self.assertEqual(created.status_code, 200)
+        result = created.json()
+        self.assertEqual(result['summary'], 'Proyecto Sistema de Ventas creado.')
+        self.assertEqual(result['project']['nombre'], 'Sistema de Ventas')
+        self.assertEqual(result['diagram']['nodes'], [])
+        self.assertEqual(result['diagram']['edges'], [])
+        self.assertTrue(ProyectoMiembro.objects.filter(
+            proyecto_id=result['project']['id'], usuario=self.user,
+            rol=ProyectoMiembro.Rol.PROPIETARIO,
+        ).exists())
+        retry = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/', payload,
+            content_type='application/json',
+        )
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(retry.json(), result)
+
+    def test_ai_interprets_dynamic_project_names_and_clarifies_missing_name(self):
+        for instruction, name in (
+            ('Crea un proyecto llamado Sistema de Ventas', 'Sistema de Ventas'),
+            ('Diana, crea un proyecto Biblioteca Digital', 'Biblioteca Digital'),
+            ('Quiero crear un proyecto Hospital Central', 'Hospital Central'),
+        ):
+            with self.subTest(instruction=instruction):
+                response = self.client.post(
+                    f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+                    {'instruction': instruction, 'request_id': f'project-{name}'},
+                    content_type='application/json',
+                )
+                self.assertEqual(response.status_code, 200)
+                operation = response.json()['operations'][0]
+                self.assertEqual(operation['op'], 'project.create')
+                self.assertEqual(operation['payload']['name'], name)
+                self.assertTrue(operation['payload']['create_main_diagram'])
+
+        clarification = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+            {'instruction': 'Crea un proyecto'}, content_type='application/json',
+        )
+        self.assertEqual(clarification.status_code, 200)
+        self.assertEqual(clarification.json(), {
+            'status': 'clarification', 'summary': '',
+            'question': '¿Qué nombre deseas para el proyecto?',
+            'message': '¿Qué nombre deseas para el proyecto?',
+            'candidates': [], 'operations': [], 'request_id': None,
+        })
+
+    def test_ai_interprets_class_entity_interface_and_attributes_without_provider(self):
+        cases = (
+            ('Diana, crea una clase llamada Persona', 'class', 'Persona', []),
+            ('Crea una clase Persona con atributo nombre de tipo String', 'class', 'Persona', [('nombre', 'String')]),
+            ('Crea una clase Producto con codigo String, nombre String y precio Decimal', 'class', 'Producto', [('codigo', 'String'), ('nombre', 'String'), ('precio', 'Decimal')]),
+            ('Crea una entidad Cliente con nombre String y correo String', 'entity', 'Cliente', [('nombre', 'String'), ('correo', 'String')]),
+            ('Diana, crea una interfaz llamada Pagable', 'interface', 'Pagable', []),
+            ('Crea una clase Factura con fecha LocalDate y total BigDecimal', 'class', 'Factura', [('fecha', 'LocalDate'), ('total', 'BigDecimal')]),
+        )
+        unavailable_provider = FakeAiProvider(error=AiProviderError('Gemini no configurado'))
+        for instruction, kind, title, attributes in cases:
+            with self.subTest(instruction=instruction):
+                with patch('diagramas.views.get_ai_provider', return_value=unavailable_provider):
+                    response = self.client.post(
+                        f'/api/diagramas/diagramas/{self.diagram.id}/interpretar-ia/',
+                        {'instruction': instruction}, content_type='application/json',
+                    )
+                self.assertEqual(response.status_code, 200, response.content)
+                body = response.json()
+                self.assertEqual(body['status'], 'ready')
+                self.assertIn('plan_id', body)
+                operation = body['operations'][0]
+                self.assertEqual((operation['kind'], operation['title']), (kind, title))
+                self.assertEqual([(item['name'], item['type']) for item in operation['properties']], attributes)
+                self.assertTrue(body['requires_confirmation'])
+        self.assertEqual(unavailable_provider.contexts, [])
+
+    def test_ai_project_create_rejects_duplicate_active_name(self):
+        Proyecto.objects.create(nombre='Biblioteca Digital', creador=self.user)
+        plan = create_plan(user=self.user, diagram=self.diagram, operations=[{
+            'id': '72a8f91d-4d4c-4f0e-8cc9-7a99136df45b', 'op': 'project.create',
+            'payload': {'name': 'Biblioteca Digital', 'create_main_diagram': True},
+        }])
+        response = self.client.post(
+            f'/api/diagramas/diagramas/{self.diagram.id}/aplicar-plan-ia/',
+            {'plan_id': str(plan.plan_id), 'idempotency_key': 'duplicate-project', 'confirm': True},
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['code'], 'duplicate_project_name')
+        self.assertIsNone(response.json()['target'])
+        self.assertIsNone(response.json()['current_revision'])
+
+    def test_project_service_rolls_back_when_main_diagram_creation_fails(self):
+        before = Proyecto.objects.filter(creador=self.user).count()
+        with patch('diagramas.models.Diagrama.objects.create', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                create_project_with_main_diagram(creator=self.user, nombre='No Persistir')
+        self.assertEqual(Proyecto.objects.filter(creador=self.user).count(), before)
+
     def test_ai_plan_rejects_confirmation_conflict_expiry_and_invalid_batch(self):
         self.diagram.nodes = [self.node('cliente', 'entity')]
         self.diagram.save()
@@ -426,7 +588,9 @@ class DiagramUmlContractTests(TestCase):
             {'plan_id': str(conflict_plan.plan_id), 'idempotency_key': 'conflict-1', 'confirm': False},
             content_type='application/json',
         )
-        self.assertEqual(conflict.status_code, 400)
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()['code'], 'stale_revision')
+        self.assertEqual(conflict.json()['current_revision'], self.diagram.revision)
 
         expired_plan = create_plan(
             user=self.user, diagram=self.diagram,
@@ -454,6 +618,8 @@ class DiagramUmlContractTests(TestCase):
             content_type='application/json',
         )
         self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(invalid.json()['code'], 'invalid_plan')
+        self.assertEqual(invalid.json()['target'], {'kind': 'node', 'id': 'missing'})
         self.diagram.refresh_from_db()
         self.assertEqual(self.diagram.nodes[0]['position'], {'x': 0, 'y': 0})
 

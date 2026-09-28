@@ -17,11 +17,36 @@ from .serializers import (
 from .spring_generator import DiagramGenerationError, generate_spring_boot_zip
 from .xmi import XmiError, export_xmi, parse_xmi
 from .ai_interpreter import (
-    AiInterpretationError, AiProviderError, build_diagram_summary, get_ai_provider,
-    validate_interpret_request, validate_provider_response,
+    AiInterpretationError, AiProviderError, build_diagram_summary, class_create_proposal, get_ai_provider,
+    project_create_proposal, validate_interpret_request, validate_provider_response,
 )
 from .ai_operations import OperationError, execute_operations
 from .ai_plans import PlanError, apply_plan, create_plan
+from .api_errors import DiagramApiError, stale_revision_error
+from .realtime import publish_diagram_update
+
+
+def destructive_impact(nodes, edges, operations):
+    """Describe existing elements a proposed delete would remove for the preview."""
+    node_ids = set()
+    edge_ids = set()
+    for operation in operations:
+        if operation.get('op') == 'delete_node':
+            node_id = operation.get('node_id')
+            if isinstance(node_id, str):
+                node_ids.add(node_id)
+        elif operation.get('op') == 'delete_relation':
+            edge_id = operation.get('edge_id')
+            if isinstance(edge_id, str):
+                edge_ids.add(edge_id)
+    edge_ids.update(
+        edge.get('id') for edge in edges
+        if edge.get('source') in node_ids or edge.get('target') in node_ids
+    )
+    return {
+        'nodes': [node_id for node_id in node_ids if any(node.get('id') == node_id for node in nodes)],
+        'edges': [edge_id for edge_id in edge_ids if isinstance(edge_id, str)],
+    }
 
 
 class DiagramAccessMixin:
@@ -64,10 +89,19 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
             locked = Diagrama.objects.select_for_update().get(pk=original_id)
             serializer.instance = locked
             self.require_diagram_role(locked, EDIT_ROLES)
+            expected_revision = serializer.validated_data.pop('expected_revision', None)
+            document_submitted = any(field in serializer.validated_data for field in ('nodes', 'edges'))
             document_changed = any(
                 field in serializer.validated_data and serializer.validated_data[field] != getattr(locked, field)
                 for field in ('nodes', 'edges')
             )
+            if document_submitted and expected_revision is None:
+                raise DiagramApiError(
+                    'expected_revision es obligatorio al guardar nodes o edges.',
+                    code='expected_revision_required', details={'field': 'expected_revision'},
+                )
+            if document_submitted and expected_revision != locked.revision:
+                raise stale_revision_error(locked.revision)
             if (
                 role_for(self.request.user, locked.proyecto)
                 == ProyectoMiembro.Rol.EDITOR
@@ -91,7 +125,13 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
                     self.request.user, serializer.validated_data['proyecto'],
                     {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
                 )
-            serializer.save(revision=locked.revision + 1 if document_changed else locked.revision)
+            revision = locked.revision + 1 if document_changed else locked.revision
+            serializer.save(revision=revision)
+            if document_changed:
+                nodes, edges = serializer.instance.nodes, serializer.instance.edges
+                transaction.on_commit(lambda: publish_diagram_update(
+                    diagram_id=original_id, nodes=nodes, edges=edges, revision=revision,
+                ))
         return
 
     def perform_destroy(self, instance):
@@ -107,19 +147,23 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         diagram = self.get_object()
         self.require_diagram_role(diagram, EDIT_ROLES)
         try:
-            instruction, selection = validate_interpret_request(
+            instruction, selection, expected_revision, _request_id = validate_interpret_request(
                 request.data, diagram.nodes, diagram.edges
             )
-            context = build_diagram_summary(diagram.nodes, diagram.edges, selection)
-            context['instruction'] = instruction
-            proposal = validate_provider_response(
-                get_ai_provider().interpret(context), diagram.nodes, diagram.edges
-            )
+            if expected_revision is not None and expected_revision != diagram.revision:
+                raise stale_revision_error(diagram.revision)
+            proposal = project_create_proposal(instruction) or class_create_proposal(instruction)
+            if proposal is None:
+                context = build_diagram_summary(diagram.nodes, diagram.edges, selection)
+                context['instruction'] = instruction
+                proposal = validate_provider_response(
+                    get_ai_provider().interpret(context), diagram.nodes, diagram.edges
+                )
             if proposal['status'] != 'ready':
                 return Response({
                     'status': proposal['status'], 'summary': proposal['summary'],
                     'question': proposal['question'], 'candidates': proposal['candidates'],
-                    'operations': [],
+                    'message': proposal['question'], 'operations': [], 'request_id': _request_id,
                 })
             candidate = execute_operations(diagram.nodes, diagram.edges, proposal['operations'])
             if candidate['edges'] != diagram.edges:
@@ -128,8 +172,13 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
                     {ProyectoMiembro.Rol.PROPIETARIO, ProyectoMiembro.Rol.ARQUITECTO},
                     'Solo un arquitecto puede proponer cambios de relaciones.',
                 )
+        except DiagramApiError as error:
+            return Response(error.detail, status=error.status_code)
         except (AiInterpretationError, AiProviderError, OperationError) as error:
-            raise ValidationError({'ai': str(error)}) from error
+            return Response({
+                'code': 'ai_interpretation_failed', 'message': str(error),
+                'target': None, 'current_revision': diagram.revision,
+            }, status=400)
 
         # Gemini has finished before this write; a plan is bound to the
         # current revision and cannot be replaced by client-provided operations.
@@ -140,9 +189,16 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
             'summary': proposal['summary'],
             'operations': proposal['operations'],
             'requires_confirmation': any(
-                operation.get('op') in {'delete_node', 'delete_relation'}
+                operation.get('op') in {
+                    'create_node', 'add_attribute', 'add_method', 'create_relation',
+                    'delete_node', 'delete_relation', 'project.create',
+                }
                 for operation in proposal['operations']
             ),
+            'destructive_impact': destructive_impact(
+                diagram.nodes, diagram.edges, proposal['operations'],
+            ),
+            'request_id': _request_id,
         })
 
     @action(detail=True, methods=['post'], url_path='aplicar-plan-ia')
@@ -154,7 +210,18 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
         try:
             result = apply_plan(user=request.user, diagram_id=pk, payload=request.data)
         except PlanError as error:
-            raise ValidationError({'ai': str(error)}) from error
+            return Response(error.detail, status=error.status_code)
+        if result.get('status') == 'applied':
+            publish_diagram_update(
+                diagram_id=pk, nodes=result['nodes'], edges=result['edges'],
+                revision=result['revision'], origin_request_id=request.data.get('idempotency_key'),
+            )
+            created = result.get('diagram')
+            if created:
+                publish_diagram_update(
+                    diagram_id=created['id'], nodes=created['nodes'], edges=created['edges'],
+                    revision=created['revision'], origin_request_id=request.data.get('idempotency_key'),
+                )
         return Response(result)
 
     @action(detail=True, methods=['post'], url_path='generar-spring-boot')
@@ -210,6 +277,11 @@ class DiagramaViewSet(DiagramAccessMixin, viewsets.ModelViewSet):
             )
             serializer.is_valid(raise_exception=True)
             serializer.save(revision=diagram.revision + 1)
+            revision = serializer.instance.revision
+            nodes, edges = serializer.instance.nodes, serializer.instance.edges
+            transaction.on_commit(lambda: publish_diagram_update(
+                diagram_id=diagram.pk, nodes=nodes, edges=edges, revision=revision,
+            ))
         return HttpResponse(
             __import__('json').dumps({
                 'nodes': serializer.instance.nodes, 'edges': serializer.instance.edges,

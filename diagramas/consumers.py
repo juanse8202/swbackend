@@ -36,7 +36,7 @@ def project_for_authorized_diagram(user_id, diagram_id):
 
 
 @database_sync_to_async
-def save_diagram_if_user_can_access(user_id, diagram_id, nodes, edges):
+def save_diagram_if_user_can_access(user_id, diagram_id, nodes, edges, expected_revision):
     """Validate and save a complete canvas under a row lock, with revision."""
     with transaction.atomic():
         diagram = Diagrama.objects.select_for_update().filter(pk=diagram_id).first()
@@ -54,6 +54,15 @@ def save_diagram_if_user_can_access(user_id, diagram_id, nodes, edges):
             return {'status': 'forbidden'}
         if membership.rol == ProyectoMiembro.Rol.EDITOR and diagram.edges != edges:
             return {'status': 'forbidden'}
+        if expected_revision != diagram.revision:
+            return {
+                'status': 'stale_revision',
+                'error': {
+                    'code': 'stale_revision',
+                    'message': 'El diagrama cambio mientras estabas editando.',
+                    'current_revision': diagram.revision,
+                },
+            }
         serializer = DiagramaSerializer(diagram, data={'nodes': nodes, 'edges': edges}, partial=True)
         if not serializer.is_valid():
             return {
@@ -197,7 +206,7 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
         if content.get('type') != 'diagram.update':
             await self.send_json({
                 'type': 'diagram.error',
-                'detail': 'Tipo de evento no soportado.',
+                'error': {'code': 'unsupported_event', 'message': 'Tipo de evento no soportado.'},
             })
             return
 
@@ -206,7 +215,7 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
         if str(content.get('diagram_id')) != str(self.diagrama_id):
             await self.send_json({
                 'type': 'diagram.error',
-                'detail': 'El diagrama del evento no coincide con la conexion.',
+                'error': {'code': 'diagram_mismatch', 'message': 'El diagrama del evento no coincide con la conexion.'},
             })
             return
 
@@ -215,27 +224,40 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
         if not isinstance(nodes, list) or not isinstance(edges, list):
             await self.send_json({
                 'type': 'diagram.error',
-                'detail': 'nodes y edges deben ser listas.',
+                'error': {'code': 'invalid_document', 'message': 'nodes y edges deben ser listas.'},
+            })
+            return
+        expected_revision = content.get('expected_revision')
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0:
+            await self.send_json({
+                'type': 'diagram.error',
+                'error': {
+                    'code': 'expected_revision_required',
+                    'message': 'expected_revision debe ser un entero no negativo.',
+                },
             })
             return
 
         # El permiso se comprueba tambien en cada escritura, por si el
         # colaborador fue retirado despues de abrir el WebSocket.
         result = await save_diagram_if_user_can_access(
-            self.scope['user'].id, self.diagrama_id, nodes, edges
+            self.scope['user'].id, self.diagrama_id, nodes, edges, expected_revision
         )
         if result['status'] == 'forbidden':
             await self.send_json({
                 'type': 'diagram.error',
-                'detail': 'No tienes permiso para editar este diagrama.',
+                'error': {'code': 'permission_denied', 'message': 'No tienes permiso para editar este diagrama.'},
             })
             await self.close(code=4403)
             return
         if result['status'] == 'invalid':
             await self.send_json({
                 'type': 'diagram.error',
-                'detail': result['detail'],
+                'error': {'code': 'invalid_document', 'message': result['detail']},
             })
+            return
+        if result['status'] == 'stale_revision':
+            await self.send_json({'type': 'diagram.error', 'error': result['error']})
             return
 
         revision = result['revision']
@@ -250,6 +272,7 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
                 'nodes': nodes,
                 'edges': edges,
                 'revision': revision,
+                'origin_request_id': content.get('request_id'),
                 'sender_channel_name': self.channel_name,
             },
         )
@@ -264,6 +287,7 @@ class DiagramaConsumer(AsyncJsonWebsocketConsumer):
                 'nodes': event['nodes'],
                 'edges': event['edges'],
                 'revision': event.get('revision'),
+                'origin_request_id': event.get('origin_request_id'),
             })
 
     async def presence_update(self, event):

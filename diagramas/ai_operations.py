@@ -7,6 +7,7 @@ validates the resulting React Flow document before any write is authorised.
 
 from copy import deepcopy
 from math import isfinite
+from uuid import UUID
 
 from rest_framework import serializers
 
@@ -35,6 +36,7 @@ RELATION_DATA_FIELDS = {
     'associationClassNodeId',
 }
 OPERATION_FIELDS = {
+    'project.create': {'id', 'op', 'payload'},
     'create_node': {'op', 'temp_id', 'kind', 'title', 'position', 'properties', 'methods', 'abstract'},
     'update_node': {'op', 'node_id', 'patch'},
     'move_node': {'op', 'node_id', 'position'},
@@ -79,6 +81,13 @@ def _position(value, index):
             _reject(index, f'position.{axis} debe ser un número finito.')
         result[axis] = number
     return result
+
+
+def _project_create(value, index):
+    value = _strict_object(value, {'name', 'create_main_diagram'}, index, 'payload', required={'name', 'create_main_diagram'})
+    if value['create_main_diagram'] is not True:
+        _reject(index, 'project.create requiere create_main_diagram=true.')
+    return {'name': _nonempty_text(value['name'], index, 'payload.name', limit=200), 'create_main_diagram': True}
 
 
 def _node_id(nodes):
@@ -146,7 +155,7 @@ def execute_operations(nodes, edges, operations):
         operation = _strict_object(
             operation,
             {
-                'op', 'temp_id', 'kind', 'title', 'position', 'properties', 'methods', 'abstract',
+                'id', 'op', 'payload', 'temp_id', 'kind', 'title', 'position', 'properties', 'methods', 'abstract',
                 'node_id', 'patch', 'attribute', 'attribute_name', 'source', 'target',
                 'relation_type', 'data', 'edge_id', 'cascade_incident',
             },
@@ -161,7 +170,14 @@ def execute_operations(nodes, edges, operations):
         unknown = set(operation) - allowed_fields
         if unknown:
             _reject(index, f'{op} contiene claves no permitidas: {", ".join(sorted(unknown))}.')
-        if op == 'create_node':
+        if op == 'project.create':
+            operation_id = operation.get('id')
+            try:
+                UUID(str(operation_id))
+            except (TypeError, ValueError) as error:
+                _reject(index, 'project.create requiere id UUID estable.')
+            operation['payload'] = _project_create(operation.get('payload'), index)
+        elif op == 'create_node':
             required = {'kind', 'title'}
             if not required <= set(operation):
                 _reject(index, 'create_node requiere kind y title.')
