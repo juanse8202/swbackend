@@ -207,12 +207,20 @@ SOCIALACCOUNT_PROVIDERS = {
 }
 
 # Configuración de CORS
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+def _origins_from_env(name, default):
+    raw_value = os.getenv(name, '')
+    if not raw_value:
+        return list(default)
+    return [origin.strip().rstrip('/') for origin in raw_value.split(',') if origin.strip()]
+
+
+LOCAL_FRONTEND_ORIGINS = (
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+)
+CORS_ALLOWED_ORIGINS = _origins_from_env('CORS_ALLOWED_ORIGINS', LOCAL_FRONTEND_ORIGINS)
 CORS_ALLOW_CREDENTIALS = True
-CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS
+CSRF_TRUSTED_ORIGINS = _origins_from_env('CSRF_TRUSTED_ORIGINS', CORS_ALLOWED_ORIGINS)
 
 # Solo el backend consume estas variables. Nunca se exponen al navegador.
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
