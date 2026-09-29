@@ -177,7 +177,7 @@ AUTHENTICATION_BACKENDS = [
     'allauth.account.auth_backends.AuthenticationBackend',
 ]
 
-SITE_ID = 2
+SITE_ID = int(os.getenv('DJANGO_SITE_ID', '1'))
 ACCOUNT_LOGIN_METHODS = {'username', 'email'}
 ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'password2*']
 ACCOUNT_ADAPTER = 'config.adapters.EmailUsernameAccountAdapter'
