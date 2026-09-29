@@ -32,6 +32,10 @@ DEBUG = os.getenv('DEBUG', 'False').lower() in ('1', 'true', 'yes', 'on')
 
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
+# En producci\u00f3n Nginx termina TLS y reenv\u00eda este encabezado a Django.
+# Sin esta configuraci\u00f3n, django-allauth genera callbacks OAuth con http://.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
 
 # Application definition
 
